@@ -7,6 +7,8 @@ section matching the pushed tag as the GitHub release notes.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-14
+
 ### Added
 
 - **PS5 backend** over ps5debug-NG v1.3.2: `target.ps5_connect/ps5_disconnect/ps5_reconnect/ps5_auto/ps5_notify`
@@ -263,5 +265,6 @@ section matching the pushed tag as the GitHub release notes.
   live memory, debugger, static analysis and decompiler, Tauri front end and
   MCP server.
 
-[Unreleased]: https://github.com/NetVar1337/PS4-Slop/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/NetVar1337/SlopStation/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/NetVar1337/SlopStation/compare/v0.2.3...v0.3.0
 [0.1.1]: https://github.com/NetVar1337/PS4-Slop/releases/tag/v0.1.1
