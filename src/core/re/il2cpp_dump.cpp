@@ -203,7 +203,7 @@ struct bin_t {
     }
     // count*8 bytes of pointers at va, count sane
     bool array(uint64_t va, uint64_t count) const {
-        return count < (1ull << 28) && mapped(va, count * 8 ? count * 8 : 1);
+        return count < (1ull << 28) && mapped(va, count != 0 ? count * 8 : 1);
     }
     std::vector<const image_segment_t*> data_segs() const {
         std::vector<const image_segment_t*> d;
@@ -985,7 +985,7 @@ dump_result_t dump(const std::vector<uint8_t>& metadata, const binary_image_t& i
         const uint64_t inst_n = bin.q(mreg + MR_GENERIC_INSTS_COUNT), insts = bin.q(mreg + MR_GENERIC_INSTS);
         const uint64_t rec = (cx.bv == 245 || cx.bv >= 271) ? 16 : 12;
         if (tab_n && tab_n < (1ull << 24) && spec_n < (1ull << 24) && bin.mapped(tab, tab_n * rec) &&
-            bin.mapped(specs, spec_n * 12 ? spec_n * 12 : 1) && bin.array(insts, inst_n)) {
+            bin.mapped(specs, spec_n != 0 ? spec_n * 12 : 1) && bin.array(insts, inst_n)) {
             for (uint64_t i = 0; i < tab_n; ++i) {
                 int32_t spec_i = -1, ptr_i = -1;
                 bin.get(tab + i * rec, spec_i);

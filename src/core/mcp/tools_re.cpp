@@ -75,7 +75,9 @@ std::string write_out(const std::string& dir, const std::string& name, const std
     return path;
 }
 
-bool same_name(const std::string& a, const std::string& b) { return _stricmp(a.c_str(), b.c_str()) == 0; }
+bool same_name(const std::string& a, const std::string& b) {
+    return a.size() == b.size() && icontains(b, a);   // portable, case-insensitive
+}
 
 // a loaded module of the active target: its mapped span (gaps zero-filled)
 // plus the segment map when the backend reports one (console modules)
