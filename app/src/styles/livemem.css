@@ -1,0 +1,283 @@
+/* app/src/styles/livemem.css
+   live-memory views (scanner, watch history, hex caret, pointer scan, access
+   tracer). Own `lm-` classes only; app.css keeps the shared primitives */
+
+/* --- flex helpers -------------------------------------------------------- */
+
+.lm-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+/* inputs and selects that take the remaining width instead of a fixed one */
+.lm-grow,
+.addr-input.lm-grow,
+.select.lm-grow {
+  flex: 1 1 0;
+  width: auto;
+  min-width: 0;
+}
+
+.lm-shrink {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.lm-fixed {
+  flex: none;
+  white-space: nowrap;
+}
+
+.lm-fill,
+.addr-input.lm-fill {
+  width: 100%;
+  min-width: 0;
+}
+
+.lm-ellipsis {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* bars whose controls outgrow a narrow column wrap instead of clipping */
+.view-bar.lm-wrap,
+.dbg-head.lm-wrap {
+  flex-wrap: wrap;
+  row-gap: var(--pad-xs);
+  min-width: 0;
+}
+
+.lm-bar-note {
+  flex: 1 0 100%;
+  font-size: 11px;
+}
+
+.lm-note {
+  padding: var(--pad-sm) var(--pad-md);
+  font-size: var(--type-small);
+}
+
+.lm-empty {
+  display: grid;
+  justify-items: start;
+  gap: var(--pad-sm);
+  padding: var(--pad-md);
+}
+
+.lm-border-top {
+  border-top: 1px solid var(--border-soft);
+}
+
+.lm-actions-static {
+  display: flex;
+  flex: none;
+  gap: 1px;
+}
+
+.lm-addr-input,
+.addr-input.lm-addr-input {
+  width: 15ch;
+  min-width: 0;
+}
+
+.lm-short-input,
+.addr-input.lm-short-input {
+  width: 9ch;
+  min-width: 0;
+}
+
+/* --- scanner ------------------------------------------------------------- */
+
+.lm-scan-head {
+  display: grid;
+  gap: var(--pad-xs);
+  padding: var(--pad-sm);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.lm-scan-body {
+  display: grid;
+  /* results head, hits, pager, watch head, watch rows, watch detail */
+  grid-template-rows: auto minmax(0, 1fr) auto auto minmax(0, 1fr) auto;
+  min-height: 0;
+}
+
+.lm-hit {
+  gap: var(--pad-sm);
+  font-size: 11.5px;
+}
+
+.lm-hit .icon-button,
+.lm-chain .icon-button,
+.icon-button.lm-mini {
+  width: 20px;
+  height: 18px;
+}
+
+.lm-actions {
+  display: flex;
+  flex: none;
+  gap: 1px;
+  opacity: 0.35;
+}
+
+.lm-hit:hover .lm-actions,
+.lm-hit:focus-within .lm-actions {
+  opacity: 1;
+}
+
+.lm-pager {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px var(--pad-sm);
+  font-size: 11px;
+  color: var(--text-dim);
+  border-top: 1px solid var(--border-soft);
+}
+
+.lm-pager-text {
+  flex: 1;
+  text-align: center;
+}
+
+/* fixed layout so a long label or value ellipsizes instead of widening the table */
+.lm-watch-table {
+  table-layout: fixed;
+}
+
+.lm-watch-table .lm-col-addr {
+  width: calc(12ch + 2 * var(--pad-sm) + 4px);
+}
+
+.lm-watch-table .lm-col-width {
+  width: 34px;
+}
+
+.lm-col-icon {
+  width: 28px;
+}
+
+.lm-watch-table td {
+  max-width: 0;
+}
+
+.lm-watch-detail {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  max-height: 200px;
+  min-height: 0;
+  border-top: 1px solid var(--border);
+}
+
+.lm-spark {
+  width: 100%;
+  height: 36px;
+  padding: 2px var(--pad-md);
+}
+
+.lm-spark polyline {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+
+.lm-history-scroll {
+  min-height: 0;
+  overflow: auto;
+}
+
+.lm-history-scroll .table {
+  table-layout: fixed;
+}
+
+.lm-history-scroll td {
+  max-width: 0;
+}
+
+.lm-col-age {
+  width: 9ch;
+}
+
+/* --- hex caret ----------------------------------------------------------- */
+
+.mem-value.lm-value {
+  justify-content: flex-start;
+  align-items: center;
+  min-width: 0;
+}
+
+.mem-value.lm-value > .lm-grow {
+  text-align: right;
+}
+
+.lm-write {
+  display: grid;
+  gap: 2px;
+  padding-bottom: var(--pad-sm);
+  margin-bottom: var(--pad-sm);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+/* --- pointer scan / access tracer panes ---------------------------------- */
+
+.lm-pane {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  max-height: min(340px, 45vh);
+  min-height: 0;
+  border-top: 1px solid var(--border);
+}
+
+.lm-chain {
+  position: static;
+  height: 20px;
+}
+
+.lm-access {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  max-height: min(320px, 42vh);
+  min-height: 0;
+  border-top: 1px solid var(--border);
+}
+
+.lm-sites {
+  table-layout: fixed;
+}
+
+.lm-sites td {
+  max-width: 0;
+}
+
+.lm-sites .lm-col-count {
+  width: 8ch;
+}
+
+.lm-sites .lm-col-site {
+  width: 34%;
+}
+
+.lm-dbg-local {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+  height: 100%;
+}
+
+.lm-dbg-local-hint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--pad-sm) var(--pad-md);
+  padding: var(--pad-sm) var(--pad-md);
+}
+
+.lm-dbg-local .lm-access {
+  max-height: none;
+}

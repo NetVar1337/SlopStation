@@ -66,6 +66,8 @@ input {
 .app {
   display: grid;
   grid-template-rows: var(--titlebar-h) 1fr var(--statusbar-h);
+  /* A long status/title string must never widen the window's only column */
+  grid-template-columns: minmax(0, 1fr);
   height: 100%;
   background: var(--bg-0);
 }
@@ -108,6 +110,10 @@ input {
   grid-template-columns: var(--scan-w, 316px) 4px minmax(0, 1fr);
   min-height: 0;
   min-width: 0;
+}
+
+.center-top[data-scanner="closed"] {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 /* --- titlebar ------------------------------------------------------------ */
@@ -440,6 +446,7 @@ input {
 .tabs {
   display: flex;
   align-items: stretch;
+  min-width: 0;
   height: var(--tabbar-h);
   border-bottom: 1px solid var(--border-soft);
 }
@@ -447,11 +454,13 @@ input {
 .tab {
   position: relative;
   display: flex;
+  flex: none;
   align-items: center;
   gap: var(--pad-sm);
   padding: 0 var(--pad-md);
   font-size: var(--type-small);
   color: var(--text-faint);
+  white-space: nowrap;
 }
 
 .tab:hover {
@@ -552,7 +561,8 @@ input {
 .statusbar {
   display: flex;
   align-items: center;
-  gap: var(--pad-lg);
+  gap: var(--pad-md);
+  min-width: 0;
   padding: 0 var(--pad-sm) 0 var(--pad-md);
   font-size: 12px;
   color: var(--text-dim);
@@ -560,14 +570,38 @@ input {
   border-top: 1px solid var(--border-soft);
 }
 
+/* Pills and the target name shrink to an ellipsis (full text in data-tip);
+   the right-hand buttons never do */
 .status-pill {
   display: flex;
+  flex: 0 1 auto;
   align-items: center;
   gap: var(--pad-sm);
+  min-width: 7px;
   white-space: nowrap;
 }
 
+.status-text,
+.status-target {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-target {
+  flex: 0 1 auto;
+  min-width: 40px;
+}
+
+.statusbar .menu-root {
+  display: flex;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
 .dot {
+  flex: none;
   width: 7px;
   height: 7px;
   border-radius: 50%;
@@ -588,6 +622,7 @@ input {
 
 .status-actions {
   display: flex;
+  flex: none;
   gap: 2px;
 }
 
@@ -618,13 +653,18 @@ input {
 .splash {
   display: grid;
   place-items: center;
+  min-height: 0;
   height: 100%;
+  padding: var(--pad-md);
+  overflow: hidden;
   background: var(--bg-0);
 }
 
 .splash-card {
   width: min(620px, 86vw);
+  max-height: 100%;
   padding: var(--pad-lg);
+  overflow: auto;
   background: var(--bg-1);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -680,7 +720,7 @@ input {
 
 .disasm {
   display: grid;
-  grid-template-columns: minmax(180px, 260px) minmax(0, 1fr);
+  grid-template-columns: minmax(150px, min(260px, 30%)) minmax(0, 1fr);
   min-height: 0;
   height: 100%;
 }
@@ -750,6 +790,8 @@ input {
 
 .listing-head {
   display: flex;
+  flex-wrap: wrap;
+  min-width: 0;
   align-items: center;
   gap: var(--pad-md);
   padding: var(--pad-sm) var(--pad-md);
@@ -844,6 +886,8 @@ input {
 
 .view-bar {
   display: flex;
+  flex-wrap: wrap;
+  min-width: 0;
   align-items: center;
   gap: var(--pad-md);
   padding: var(--pad-sm) var(--pad-md);
@@ -1027,7 +1071,7 @@ input {
 
 .types {
   display: grid;
-  grid-template-columns: 220px minmax(0, 1fr);
+  grid-template-columns: minmax(140px, 28%) minmax(0, 1fr);
   min-height: 0;
   height: 100%;
 }
@@ -1721,6 +1765,7 @@ html[data-motion="off"] *::after {
 
 .engine-banner {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--pad-sm);
   padding: var(--pad-xs) var(--pad-md);
@@ -1728,6 +1773,14 @@ html[data-motion="off"] *::after {
   color: var(--text);
   background: color-mix(in srgb, var(--danger) 18%, var(--bg-1));
   border-bottom: 1px solid var(--danger);
+}
+
+/* The message takes the row and wraps; the buttons drop to the next line
+   instead of being pushed off-screen by a long reason or log path */
+.engine-banner > span:first-child {
+  flex: 1 1 240px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .update-banner {
@@ -1752,10 +1805,16 @@ html[data-motion="off"] *::after {
 
 .splash-error {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: center;
   gap: var(--pad-md);
   color: var(--danger);
+}
+
+.splash-error > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 /* --- targets ------------------------------------------------------------- */
@@ -1801,7 +1860,14 @@ html[data-motion="off"] *::after {
   white-space: nowrap;
 }
 
+/* Scrolls inside the panel body: a tall connect area starts at the top
+   instead of being centred off both edges of a short panel */
 .connect-empty {
+  grid-template-columns: minmax(0, 1fr);
+  justify-content: stretch;
+  align-content: safe center;
+  height: auto;
+  min-height: 100%;
   gap: var(--pad-md);
   padding: var(--pad-lg);
   text-align: center;
@@ -1883,7 +1949,10 @@ html[data-motion="off"] *::after {
 }
 
 .workspace-meta {
+  flex: 0 10 auto;
   align-self: center;
+  min-width: 0;
+  max-width: 40%;
   margin-right: 8px;
   overflow: hidden;
   font-size: var(--type-small);
@@ -2147,11 +2216,20 @@ fieldset.settings-group {
   align-items: center;
   justify-content: space-between;
   gap: var(--pad-md);
+  min-width: 0;
   padding: 5px var(--pad-md);
   font-size: var(--type-small);
   color: var(--text-dim);
   border-radius: var(--radius-sm);
   cursor: default;
+}
+
+/* Long demangled names ellipsize; the hint (address, path) stays visible */
+.palette [cmdk-item] > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .palette [cmdk-item][data-selected="true"] {
@@ -2160,7 +2238,12 @@ fieldset.settings-group {
 }
 
 .palette-hint {
+  flex: none;
+  max-width: 45%;
+  overflow: hidden;
   font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   opacity: 0.75;
 }
 
@@ -2242,6 +2325,8 @@ fieldset.settings-group {
 
 .decomp-head {
   display: flex;
+  flex-wrap: wrap;
+  min-width: 0;
   align-items: center;
   gap: var(--pad-sm);
   padding: var(--pad-sm) var(--pad-md);
@@ -2538,7 +2623,7 @@ fieldset.settings-group {
 }
 
 .tool-table-scroll {
-  height: 260px;
+  height: clamp(140px, 32vh, 260px);
   overflow: auto;
   border: 1px solid var(--border-soft);
 }
@@ -2618,4 +2703,261 @@ fieldset.settings-group {
 
 .table tbody tr[data-severity="warn"] td:first-child {
   color: var(--warning);
+}
+
+/* --- responsive layout (1100-1680px windows) ----------------------------- */
+
+/* Workspace tab strip: scrolls sideways, fades and shows arrows on the side
+   that hides tabs, so the meta text and open/close button stay visible */
+.tabs-scroll {
+  display: flex;
+  flex: 0 1 auto;
+  min-width: 64px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.tabs-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.tabs-scroll .tab::after {
+  bottom: 0;
+}
+
+.tabs-scroll[data-fade-right="true"] {
+  mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
+}
+
+.tabs-scroll[data-fade-left="true"] {
+  mask-image: linear-gradient(to left, #000 calc(100% - 24px), transparent);
+}
+
+.tabs-scroll[data-fade-left="true"][data-fade-right="true"] {
+  mask-image: linear-gradient(
+    to right,
+    transparent,
+    #000 24px,
+    #000 calc(100% - 24px),
+    transparent
+  );
+}
+
+.tabs-arrow,
+.workspace-close {
+  flex: none;
+  align-self: center;
+}
+
+.workspace-close {
+  margin-right: 6px;
+}
+
+/* Virtualised tables: rows are absolutely positioned display:table boxes, so
+   the header must be one too, with the same explicit column widths */
+/* The table itself is a block so thead/tbody are plain blocks (no anonymous
+   table boxes around them) */
+.vtable {
+  display: block;
+}
+
+.vtable thead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: block;
+}
+
+.vtable thead th {
+  position: static;
+}
+
+.vtable thead tr {
+  display: table;
+  width: 100%;
+  table-layout: fixed;
+}
+
+.vtable tbody {
+  display: block;
+}
+
+/* Auto-layout tables: numeric columns shrink to their content, one text
+   column takes the rest and ellipsizes */
+.table .col-fit {
+  width: 1%;
+  white-space: nowrap;
+}
+
+.table td.col-fill {
+  width: 100%;
+  max-width: 0;
+}
+
+/* Targets: one console connect area (PS4/PS5 switch) in the panel flow */
+.connect-area {
+  display: grid;
+  gap: var(--pad-sm);
+  justify-self: center;
+  width: min(460px, 100%);
+  min-width: 0;
+  text-align: left;
+}
+
+.connect-area[data-compact="true"] {
+  width: 100%;
+  padding: var(--pad-sm) var(--pad-md);
+}
+
+.connect-area .connect-bar {
+  padding: 0;
+  border-bottom: none;
+}
+
+.connect-area .payload-card {
+  width: 100%;
+}
+
+.connect-area .consoles-card {
+  padding: var(--pad-sm);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.connect-drawer {
+  max-height: 45vh;
+  overflow: auto;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.seg {
+  display: inline-flex;
+  justify-self: center;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.seg-button {
+  padding: 2px 14px;
+  font-size: var(--type-small);
+  color: var(--text-dim);
+}
+
+.seg-button + .seg-button {
+  border-left: 1px solid var(--border);
+}
+
+.seg-button[aria-pressed="true"] {
+  color: var(--bg-0);
+  background: var(--accent);
+}
+
+/* Scripts: snippets beside the editor when wide, above it in the side slot */
+.scripts-panel {
+  container-type: inline-size;
+}
+
+.scripts-split {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+
+.scripts-aside {
+  flex: 0 0 170px;
+  min-width: 0;
+  padding: var(--pad-sm);
+  overflow-y: auto;
+  font-size: 12px;
+  border-right: 1px solid var(--border-soft);
+}
+
+.scripts-split > .scripts-body {
+  min-height: 0;
+}
+
+@container (max-width: 460px) {
+  .scripts-split {
+    flex-direction: column;
+  }
+
+  .scripts-aside {
+    flex: 0 0 auto;
+    max-height: 34%;
+    border-right: none;
+    border-bottom: 1px solid var(--border-soft);
+  }
+}
+
+/* Help > Guides */
+.guide-body {
+  display: grid;
+  gap: var(--pad-sm);
+}
+
+.guide-list,
+.guide-steps {
+  display: grid;
+  gap: var(--pad-sm);
+  margin: 0;
+}
+
+.guide-list {
+  padding: 0;
+  list-style: none;
+}
+
+.guide-item {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  padding: var(--pad-sm);
+  text-align: left;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+}
+
+.guide-item:hover {
+  background: var(--bg-2);
+  border-color: var(--accent);
+}
+
+.guide-item-title {
+  color: var(--text);
+}
+
+.guide-item-sum {
+  font-size: var(--type-small);
+  color: var(--text-faint);
+}
+
+.guide-summary {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.guide-steps {
+  padding-left: 1.4em;
+}
+
+.guide-steps li {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.guide-steps code {
+  font-size: var(--type-small);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.guide-back {
+  justify-self: start;
+}
+
+.targets-notes:not(:empty) {
+  padding: var(--pad-sm) var(--pad-md);
 }

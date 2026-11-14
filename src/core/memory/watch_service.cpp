@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 
 #include "core/infra/clock.hpp"
 #include "core/infra/event_bus.hpp"
@@ -34,6 +36,7 @@ struct state_t {
     uint64_t             next_id     = 1;
     int64_t              last_pass_ms = 0;
     size_t               cursor       = 0;   // round-robin start for the budgets
+    std::unordered_map<uint64_t, std::deque<sample_t>> hist;   // per-entry value ring
 };
 
 state_t& st() {
@@ -45,6 +48,16 @@ entry_t* find(state_t& s, uint64_t id) {
     auto it = std::find_if(s.entries.begin(), s.entries.end(),
                            [id](const entry_t& e) { return e.id == id; });
     return it == s.entries.end() ? nullptr : &*it;
+}
+
+// the history rule: a change, or one heartbeat sample per second
+bool record_locked(state_t& s, uint64_t id, int64_t ms, uint64_t bits) {
+    if (!find(s, id)) return false;
+    auto& ring = s.hist[id];
+    if (!ring.empty() && ring.back().bits == bits && ms - ring.back().ms < 1000) return false;
+    if (ring.size() >= kHistoryCap) ring.pop_front();
+    ring.push_back({ms, bits});
+    return true;
 }
 
 const char* width_name(value_width_t w) noexcept {
@@ -113,6 +126,7 @@ bool remove(uint64_t id) {
     s.last.erase(std::remove_if(s.last.begin(), s.last.end(),
                                 [id](const value_t& v) { return v.id == id; }),
                  s.last.end());
+    s.hist.erase(id);
     publish_list_locked(s);
     return true;
 }
@@ -122,6 +136,7 @@ void clear() {
     std::lock_guard lk(s.mu);
     s.entries.clear();
     s.last.clear();
+    s.hist.clear();
     publish_list_locked(s);
 }
 
@@ -298,6 +313,19 @@ size_t size() {
     state_t& s = st();
     std::lock_guard lk(s.mu);
     return s.entries.size();
+}
+
+bool history(uint64_t id, size_t limit, std::vector<sample_t>& out) {
+    state_t& s = st();
+    std::lock_guard lk(s.mu);
+    out.clear();
+    if (!find(s, id)) return false;
+    const auto it = s.hist.find(id);
+    if (it == s.hist.end()) return true;
+    const auto& ring = it->second;
+    const size_t take = std::min(limit, ring.size());
+    out.assign(ring.end() - static_cast<std::ptrdiff_t>(take), ring.end());
+    return true;
 }
 
 // Cheat Engine .CT round trip
@@ -579,6 +607,12 @@ std::vector<value_t> sample_pass(const std::vector<entry_t>& entries,
     return out;
 }
 
+bool record_sample(uint64_t id, int64_t ms, uint64_t bits) {
+    state_t& s = st();
+    std::lock_guard lk(s.mu);
+    return record_locked(s, id, ms, bits);
+}
+
 } // namespace detail
 
 namespace {
@@ -635,6 +669,7 @@ void tick() {
 
     session_io_t io(*session);
     const int64_t now = infra::steady_ms();
+    const int64_t wall = infra::wall_ms();
     const std::vector<value_t> sampled =
         detail::sample_pass(snap, prev, io, kPassLimits, cursor, nullptr, now);
 
@@ -650,6 +685,7 @@ void tick() {
             if (!v.sampled) continue;   // rate-skipped or budget-deferred
             e->last_sample_ms = now;
             if (!e->freeze && v.ok) e->frozen_bits = v.bits;
+            if (v.ok) record_locked(s, v.id, wall, v.bits);
             // freeze-once: release as soon as the hold actually landed
             if (e->freeze && e->freeze_once && v.wrote) {
                 e->freeze = false;
@@ -693,6 +729,7 @@ void shutdown() {
     std::lock_guard lk(s.mu);
     s.entries.clear();
     s.last.clear();
+    s.hist.clear();
     s.last_pass_ms = 0;
 }
 

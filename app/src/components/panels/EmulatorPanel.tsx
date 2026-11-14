@@ -34,6 +34,9 @@ function RegTable({ regs }: { regs: EmuRegs }) {
   );
 }
 
+/** Fits a 0x-prefixed 64-bit address in the mono font plus cell padding. */
+const kIpCol = 172;
+
 function TraceList({ rows }: { rows: EmuTraceRow[] }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const virtualizer = useVirtualizer({
@@ -45,11 +48,13 @@ function TraceList({ rows }: { rows: EmuTraceRow[] }) {
   return (
     <div className="tool-table-wrap">
       <div className="tool-table-scroll" ref={scrollRef}>
-        <table className="table">
+        <table className="table vtable">
           <caption className="sr-only">Execution trace</caption>
           <thead>
             <tr>
-              <th scope="col">IP</th>
+              <th scope="col" style={{ width: kIpCol }}>
+                IP
+              </th>
               <th scope="col">Instruction</th>
             </tr>
           </thead>
@@ -69,8 +74,12 @@ function TraceList({ rows }: { rows: EmuTraceRow[] }) {
                     tableLayout: "fixed",
                   }}
                 >
-                  <td className="mono faint">{hex(t.ip, 1)}</td>
-                  <td className="mono">{t.text}</td>
+                  <td className="mono faint" style={{ width: kIpCol }}>
+                    {hex(t.ip, 1)}
+                  </td>
+                  <td className="mono" data-tip={t.text}>
+                    {t.text}
+                  </td>
                 </tr>
               );
             })}

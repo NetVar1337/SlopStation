@@ -7,6 +7,9 @@ import * as events from "@/lib/events";
 import { call, errorText } from "@/lib/rpc";
 import type { WatchEntry, WatchValue } from "@/lib/events";
 
+/** One memory.watch_history sample; `ms` is engine epoch time. */
+export type WatchSample = { ms: number; value: number | string };
+
 type WatchStore = {
   entries: WatchEntry[];
   values: Map<number, WatchValue>;
@@ -24,6 +27,8 @@ type WatchStore = {
   /** Append the entries of a .CT table to the list. */
   importCt: (path: string) => Promise<boolean>;
   clear: () => Promise<boolean>;
+  /** Last `limit` samples of an entry, oldest first; null (and `error`) on failure. */
+  history: (id: number, limit?: number) => Promise<WatchSample[] | null>;
 };
 
 export const useWatch = create<WatchStore>((set) => {
@@ -92,5 +97,18 @@ export const useWatch = create<WatchStore>((set) => {
     importCt: (path) => run(() => call("memory", "watch_import_ct", { path })),
 
     clear: () => run(() => call("memory", "watch_clear")),
+
+    history: async (id, limit = 256) => {
+      try {
+        const res = await call<{ samples?: WatchSample[] }>("memory", "watch_history", {
+          id,
+          limit,
+        });
+        return res.samples ?? [];
+      } catch (e) {
+        set({ error: errorText(e) });
+        return null;
+      }
+    },
   };
 });

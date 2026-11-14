@@ -80,6 +80,10 @@ set(SLOP_CORE_SOURCES
     re/rtti.cpp
     re/type_catalog.hpp
     re/type_catalog.cpp
+    re/il2cpp_dump.hpp
+    re/il2cpp_dump.cpp
+    re/ue_dump.hpp
+    re/ue_dump.cpp
     process/heap_list.hpp
     process/heap_list.cpp
     infra/deferred.hpp

@@ -89,19 +89,19 @@ export default function PeView() {
             </caption>
             <thead>
               <tr>
-                <th scope="col" style={{ width: 90 }}>
+                <th scope="col" className="col-fit">
                   {t("pe.name")}
                 </th>
-                <th scope="col" style={{ width: 130 }}>
+                <th scope="col" className="col-fit">
                   {t("pe.va")}
                 </th>
-                <th scope="col" style={{ width: 90 }}>
+                <th scope="col" className="col-fit">
                   {t("pe.rva")}
                 </th>
-                <th scope="col" style={{ width: 90 }}>
+                <th scope="col" className="col-fit">
                   {t("pe.virtual")}
                 </th>
-                <th scope="col" style={{ width: 90 }}>
+                <th scope="col" className="col-fit">
                   {t("pe.raw")}
                 </th>
                 <th scope="col">{t("pe.flags")}</th>
@@ -178,11 +178,11 @@ export default function PeView() {
             <thead>
               <tr>
                 {isPe && (
-                  <th scope="col" style={{ width: 70 }}>
+                  <th scope="col" className="col-fit">
                     {t("pe.ordinal")}
                   </th>
                 )}
-                <th scope="col" style={{ width: 130 }}>
+                <th scope="col" className="col-fit">
                   {t("pe.va")}
                 </th>
                 <th scope="col">{t("pe.name")}</th>
@@ -201,7 +201,9 @@ export default function PeView() {
                       {hex(base + e.rva)}
                     </button>
                   </td>
-                  <td className="mono">{e.name}</td>
+                  <td className="mono col-fill" data-tip={e.name}>
+                    {e.name}
+                  </td>
                 </tr>
               ))}
             </tbody>

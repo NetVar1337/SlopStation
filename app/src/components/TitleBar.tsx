@@ -49,6 +49,9 @@ export default function TitleBar() {
   const inspectorOpen = useUi((s) => s.inspectorOpen);
   const setInspectorOpen = useUi((s) => s.setInspectorOpen);
   const resetLayout = useUi((s) => s.resetLayout);
+  const scannerOpen = useUi((s) => s.scannerOpen);
+  const setScannerOpen = useUi((s) => s.setScannerOpen);
+  const openGuide = useUi((s) => s.openGuide);
 
   useEffect(() => {
     if (open === null) return;
@@ -154,6 +157,9 @@ export default function TitleBar() {
             () => setInspectorOpen(!inspectorOpen),
             "Ctrl+Alt+I",
           )}
+          {item(t(scannerOpen ? "titlebar.hideScanner" : "titlebar.showScanner"), () =>
+            setScannerOpen(!scannerOpen),
+          )}
           {item(t("titlebar.resetLayout"), resetLayout)}
         </>,
       )}
@@ -181,6 +187,8 @@ export default function TitleBar() {
       {menu(
         "help",
         <>
+          {item(t("guide.menu"), () => openGuide(""))}
+          <div className="menu-sep" role="separator" />
           {kShortcuts.map((s) => (
             <div className="menu-item menu-static" key={s.keys}>
               <span>{t(s.labelKey)}</span>

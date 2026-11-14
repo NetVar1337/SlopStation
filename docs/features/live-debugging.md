@@ -55,6 +55,38 @@ plus the writer's callstack — the answer to "who changed this value".
 r9`); a local Win64 target passes `rcx, rdx, r8, r9`. The target stays stopped at the last
 hit — `ps4_continue` resumes it.
 
+## Find out what writes or accesses an address
+
+`ps4_find_write` stops at the first writer. The access tracer keeps going: it arms a
+hardware watchpoint, resumes the target after every hit and counts each instruction site,
+like Cheat Engine's "find out what writes to this address". It runs on a local Windows
+process (the local debugger's DR0–DR3), a PS4 and a PS5.
+
+```json
+{ "tool": "debugger", "action": "access_start",
+  "params": { "addr": "0x200001000", "len": 4, "kind": "write", "duration_ms": 0,
+              "max_hits": 100000 } }
+{ "tool": "debugger", "action": "access_status", "params": { "id": 1 } }
+{ "tool": "debugger", "action": "access_stop", "params": { "id": 1 } }
+{ "tool": "debugger", "action": "access_list", "params": {} }
+```
+
+`kind` is `write`, `access` (read or write) or `exec`; `len` is 1, 2, 4 or 8 and `addr`
+must be aligned to it (exec always uses 1). `duration_ms` 0 runs until `access_stop`.
+`access_status` and `access_stop` return `{id, running, hits, elapsed_ms, stop_reason,
+sites[]}`; each site carries `rip`, `rip_hex`, `rip_modoff`, `count`, `first_ms`, `last_ms`,
+`regs` (the general registers of its last hit) and `disasm`, sorted by count. A data
+watchpoint traps after the access, so `rip` is the next instruction; `insn_rip` and
+`disasm` name the accessing instruction decoded backwards from it.
+
+The tracer owns the debug event stream, so one runs at a time and `ps4_trace_start` is
+refused while it runs. It disarms its watchpoint when it stops for any reason (`access_stop`, `duration`,
+`max_hits`, process exit, `ps4_detach`/`ps5_detach`, console disconnect). `access_start`
+refuses an address that already carries a watchpoint.
+
+`ps4_watch_set`, `ps4_watch_clear` and `ps4_watch_list` also work on a local Windows debug
+session.
+
 ## Remote calls
 
 ```json

@@ -1,7 +1,8 @@
 // app/src/components/panels/WorkspacePanel.tsx
 // The tabbed centre area, shared across ELF, PE, Mach-O and live-target views.
 
-import { FolderOpen, ScanSearch, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { ChevronLeft, ChevronRight, FolderOpen, ScanSearch, X } from "lucide-react";
 import IconButton from "@/components/IconButton";
 import Tabs, { panelId, tabId } from "@/components/Tabs";
 import DisassemblyView from "@/components/panels/DisassemblyView";
@@ -51,15 +52,58 @@ export default function WorkspacePanel() {
   const t = useT();
   const active = useUi((s) => s.workspaceTab);
   const setActive = useUi((s) => s.setWorkspaceTab);
+  const setRail = useUi((s) => s.setRail);
   const target = useEngine((s) => s.target);
   const hype = useEngine((s) => s.hype);
   // The session is shared with agents, so the image can change without this
   // window doing anything; the engine store refreshes the mirror on
   // image.changed / hype.progress and on every reconnect
   const { image, busy, error, unload } = useDisasm();
+  const stripRef = useRef<HTMLDivElement>(null);
+  const [edges, setEdges] = useState({ left: false, right: false });
+
+  // Twelve tabs never fit a narrow workspace: the strip scrolls sideways and
+  // shows arrows on the side that has hidden tabs
+  useEffect(() => {
+    const el = stripRef.current;
+    if (el === null) return;
+    const measure = () =>
+      setEdges({
+        left: el.scrollLeft > 1,
+        right: el.scrollLeft + el.clientWidth < el.scrollWidth - 1,
+      });
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    el.addEventListener("scroll", measure, { passive: true });
+    return () => {
+      observer.disconnect();
+      el.removeEventListener("scroll", measure);
+    };
+  }, []);
+
+  useEffect(() => {
+    document
+      .getElementById(tabId("workspace", active))
+      ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [active]);
+
+  const scrollTabs = (dir: -1 | 1) =>
+    stripRef.current?.scrollBy({ left: dir * 160, behavior: "smooth" });
 
   const tabLabel = (tab: (typeof kTabs)[number]) =>
     tab.id === "pe" ? browserLabel(image.format) : t(tab.labelKey);
+  const meta = image.ready
+    ? `${image.name ?? ""}${
+        image.format !== undefined
+          ? t("workspace.metaFormat", { format: formatLabel(image.format) })
+          : ""
+      }${image.arch !== undefined ? t("workspace.metaArch", { arch: image.arch }) : ""}${
+        hype.running
+          ? t("workspace.metaAnalyzing", { percent: Math.round(hype.progress * 100) })
+          : ""
+      }`
+    : "";
 
   const body = () => {
     const tab = kTabs.find((item) => item.id === active);
@@ -72,6 +116,9 @@ export default function WorkspacePanel() {
           </div>
           <div className="empty-title">{t("workspace.noTarget")}</div>
           <div className="empty-hint">{t("workspace.noTargetHint", { tab: t(tab.labelKey) })}</div>
+          <button type="button" className="row-action" onClick={() => setRail("targets")}>
+            {t("titlebar.attachToProcess")}
+          </button>
         </div>
       );
     }
@@ -142,29 +189,49 @@ export default function WorkspacePanel() {
   return (
     <div className="panel">
       <div className="tabs">
-        <Tabs<WorkspaceTab>
-          items={kTabs.map((tab) => ({ id: tab.id, label: tabLabel(tab) }))}
-          active={active}
-          onChange={setActive}
-          label={t("workspace.views")}
-          idPrefix="workspace"
-        />
+        {edges.left && (
+          <IconButton
+            tip={t("workspace.scrollLeft")}
+            className="tabs-arrow"
+            tabIndex={-1}
+            onClick={() => scrollTabs(-1)}
+          >
+            <ChevronLeft size={14} />
+          </IconButton>
+        )}
+        <div
+          className="tabs-scroll"
+          ref={stripRef}
+          data-fade-left={edges.left}
+          data-fade-right={edges.right}
+        >
+          <Tabs<WorkspaceTab>
+            items={kTabs.map((tab) => ({ id: tab.id, label: tabLabel(tab) }))}
+            active={active}
+            onChange={setActive}
+            label={t("workspace.views")}
+            idPrefix="workspace"
+          />
+        </div>
+        {edges.right && (
+          <IconButton
+            tip={t("workspace.scrollRight")}
+            className="tabs-arrow"
+            tabIndex={-1}
+            onClick={() => scrollTabs(1)}
+          >
+            <ChevronRight size={14} />
+          </IconButton>
+        )}
         <div className="spacer" />
         {image.ready && (
-          <span className="faint workspace-meta">
-            {image.name}
-            {image.format !== undefined
-              ? t("workspace.metaFormat", { format: formatLabel(image.format) })
-              : ""}
-            {image.arch !== undefined ? t("workspace.metaArch", { arch: image.arch }) : ""}
-            {hype.running
-              ? t("workspace.metaAnalyzing", { percent: Math.round(hype.progress * 100) })
-              : ""}
+          <span className="faint workspace-meta" data-tip={meta}>
+            {meta}
           </span>
         )}
         <IconButton
           tip={image.ready ? t("workspace.closeBinary") : t("common.openBinary")}
-          style={{ alignSelf: "center", marginRight: 6 }}
+          className="workspace-close"
           onClick={() => void (image.ready ? unload() : openBinary())}
         >
           {image.ready ? <X size={14} /> : <FolderOpen size={14} />}

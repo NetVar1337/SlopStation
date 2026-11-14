@@ -1193,6 +1193,8 @@ describe("PS5 connect", () => {
     });
     useEngine.setState({ backend: { badge: "user", ps4: false } });
     render(<TargetsPanel />);
+    // PS4 and PS5 share one connect area behind a platform switch
+    await userEvent.click(screen.getByRole("button", { name: "PS5" }));
     expect(await screen.findByText(/fw 3\.00/)).toBeInTheDocument();
     await userEvent.type(screen.getByLabelText("PS5 IP address"), "10.0.0.9");
     await userEvent.click(screen.getByRole("button", { name: "Auto connect" }));

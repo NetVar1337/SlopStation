@@ -62,7 +62,7 @@ function PacketTable({ rows }: { rows: PacketRow[] }) {
   return (
     <div className="tool-table-wrap">
       <div className="tool-table-scroll" ref={scrollRef}>
-        <table className="table">
+        <table className="table vtable">
           <caption className="sr-only">Captured packets</caption>
           <thead>
             <tr>
@@ -104,15 +104,27 @@ function PacketTable({ rows }: { rows: PacketRow[] }) {
                   data-tip={p.payload_hex ?? undefined}
                   onClick={() => setSelected(p)}
                 >
-                  <td className="mono faint">{p.id}</td>
-                  <td className="mono faint">{(p.at_ms % 100000) / 1000}</td>
-                  <td>
+                  <td className="mono faint" style={{ width: 52 }}>
+                    {p.id}
+                  </td>
+                  <td className="mono faint" style={{ width: 66 }}>
+                    {(p.at_ms % 100000) / 1000}
+                  </td>
+                  <td style={{ width: 44 }}>
                     <span className="pill">{p.protocol_str}</span>
                   </td>
-                  <td className="faint">{p.direction_str === "inbound" ? "in" : "out"}</td>
-                  <td className="mono">{p.local}</td>
-                  <td className="mono">{p.remote}</td>
-                  <td className="mono faint">{p.wire_bytes}</td>
+                  <td className="faint" style={{ width: 52 }}>
+                    {p.direction_str === "inbound" ? "in" : "out"}
+                  </td>
+                  <td className="mono" data-tip={p.local}>
+                    {p.local}
+                  </td>
+                  <td className="mono" data-tip={p.remote}>
+                    {p.remote}
+                  </td>
+                  <td className="mono faint" style={{ width: 56 }}>
+                    {p.wire_bytes}
+                  </td>
                 </tr>
               );
             })}

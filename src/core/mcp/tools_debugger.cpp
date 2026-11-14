@@ -541,6 +541,9 @@ dbg::local_debugger_t& need_local() {
 }
 
 json tool_ps4_trace(const std::string& action, const json& args);
+// continuous access tracer (defined after the PS5 section)
+bool access_any_running();
+void access_stop_all();
 
 json local_bp_list_json(const dbg::local_debugger_t& d) {
     json arr = json::array();
@@ -720,6 +723,50 @@ json tool_debugger_local(const std::string& action, const json& args) {
             return o;
         }
     }
+    if (action == "ps4_watch_set") {
+        const uint64_t addr = parse_addr(args, "addr");
+        const uint64_t len = args.contains("len") ? parse_addr(args, "len") : 8;
+        const uint32_t type = static_cast<uint32_t>(args.value("type", 3u));   // 3 = read/write
+        if (type != 0 && type != 1 && type != 3)
+            fail("ps4_watch_set: type must be 0=exec, 1=write or 3=read_write");
+        if (len != 1 && len != 2 && len != 4 && len != 8)
+            fail("ps4_watch_set: len must be 1, 2, 4 or 8");
+        uint32_t index = 0;
+        bool reused = false;
+        auto io = d.wp_arm(addr, static_cast<uint32_t>(len), type, index, reused);
+        if (!io.ok) io_fail("ps4_watch_set failed", io);
+        return {{"set", true}, {"addr", addr}, {"addr_hex", addr_hex_str(addr)},
+                {"index", index}, {"len", len}, {"type", type}, {"hw", true},
+                {"already_armed", reused}, {"debugger", "user"}};
+    }
+    if (action == "ps4_watch_clear") {
+        uint64_t addr = 0;
+        uint32_t index = 0;
+        if (args.contains("addr")) {
+            addr = parse_addr(args, "addr");
+            for (const auto& s : d.watchpoints())
+                if (s.addr == addr) index = s.index;
+        } else if (args.contains("index")) {
+            index = static_cast<uint32_t>(parse_addr(args, "index"));
+            bool found = false;
+            for (const auto& s : d.watchpoints())
+                if (s.index == index) { addr = s.addr; found = true; }
+            if (!found) fail("ps4_watch_clear: no local watchpoint in slot " + std::to_string(index));
+        } else {
+            fail("ps4_watch_clear requires addr or index");
+        }
+        auto io = d.wp_disarm(addr);
+        if (!io.ok) io_fail("ps4_watch_clear failed", io);
+        return {{"cleared", true}, {"addr", addr}, {"index", index}, {"debugger", "user"}};
+    }
+    if (action == "ps4_watch_list") {
+        json arr = json::array();
+        for (const auto& s : d.watchpoints())
+            arr.push_back({{"addr", s.addr}, {"addr_hex", addr_hex_str(s.addr)},
+                           {"index", s.index}, {"armed", true}, {"len", s.len},
+                           {"type", s.type}});
+        return {{"watchpoints", arr}, {"count", arr.size()}, {"debugger", "user"}};
+    }
     if (action == "ps4_callstack") return local_callstack(args);
     if (action == "ps4_trace_start" || action == "ps4_trace_stop" ||
         action == "ps4_trace_status")
@@ -729,6 +776,8 @@ json tool_debugger_local(const std::string& action, const json& args) {
 
 bool is_local_action(const std::string& action) {
     return action == "ps4_bp_set" || action == "ps4_bp_clear" || action == "ps4_bp_list" ||
+           action == "ps4_watch_set" || action == "ps4_watch_clear" ||
+           action == "ps4_watch_list" ||
            action == "ps4_continue" || action == "ps4_step" || action == "ps4_wait" ||
            action == "ps4_callstack" || action == "ps4_trace_start" ||
            action == "ps4_trace_stop" || action == "ps4_trace_status";
@@ -917,6 +966,9 @@ json tool_ps4_trace(const std::string& action, const json& args) {
     // ps4_trace_start
     if (ts.running.load())
         fail("ps4_trace_start: a trace is already running (ps4_trace_stop first)");
+    if (access_any_running())
+        fail("ps4_trace_start: an access trace owns the debug event stream "
+             "(debugger.access_stop first)");
     if (ts.th.joinable()) ts.th.join();   // reap a trace that finished on its own
     const std::string mode = args.value("mode", std::string{"steps"});
     if (mode != "steps" && mode != "calls")
@@ -1786,6 +1838,7 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
     }
     if (action == "ps4_detach") {
         trace_stop_join();
+        access_stop_all();
         const bool clean = p.ps4_debug_detach();
         g_bp_rules.clear();   // rules belong to the dead debug session
         return {{"attached", false}, {"detach_acknowledged", clean}};
@@ -2405,6 +2458,7 @@ json tool_debugger_ps5(const std::string& action, const json& args) {
                 {"branding", p.branding()}};
     }
     if (action == "ps5_detach") {
+        access_stop_all();
         const bool clean = p.ps5_debug_detach();
         return {{"attached", false}, {"detach_acknowledged", clean}};
     }
@@ -2601,6 +2655,451 @@ json tool_debugger_ps5(const std::string& action, const json& args) {
          "ps5_wait|ps5_events|ps5_notify|ps5_print|ps5_app)");
 }
 
+// ---- continuous access tracer ("find out what writes/accesses this") -------
+// One background thread per session arms a hardware watchpoint, resumes the
+// target after every hit and aggregates the trapping instruction sites. It
+// consumes the debug event stream while it runs, so one runs at a time.
+
+// debug_target_t over the ps5debug-NG console debugger
+class ps5_debug_target_t final : public dbg::debug_target_t {
+public:
+    ps5_debug_target_t(runtime::backend_ps5_t& p, std::shared_ptr<runtime::session_t> s)
+        : p_(p), s_(std::move(s)) {}
+
+    const char* kind() const noexcept override { return "ps5"; }
+    bool attached() const override { return p_.ps5_debug_attached(); }
+    // the backend keeps no held flag: attach leaves the process stopped (as on
+    // the PS4 payload) and every consumed stop holds it until resume()
+    bool stopped() const override { return held_.load(); }
+    runtime::io_result_t bp_arm(uint64_t addr, uint32_t& index, bool& reused) override {
+        return p_.ps5_bp_arm(addr, runtime::backend_ps5_t::kAutoSlot, index, &reused);
+    }
+    runtime::io_result_t bp_disarm(uint64_t addr) override { return p_.ps5_bp_disarm_addr(addr); }
+    runtime::io_result_t wp_arm(uint64_t addr, uint32_t len, uint32_t type,
+                                uint32_t& index, bool& reused) override {
+        return p_.ps5_wp_arm(addr, len, type, runtime::backend_ps5_t::kAutoSlot, index, &reused);
+    }
+    runtime::io_result_t wp_disarm(uint64_t addr) override { return p_.ps5_wp_disarm_addr(addr); }
+    runtime::io_result_t resume() override {
+        auto io = p_.ps5_continue(runtime::ps5::kStopResume);
+        if (io.ok) held_ = false;
+        return io;
+    }
+    runtime::io_result_t step(uint32_t tid) override { return p_.ps5_step(tid); }
+    bool wait_event(dbg::stop_event_t& out, int timeout_ms) override {
+        runtime::ps5_event_t e{};
+        if (!p_.ps5_wait_event(e, timeout_ms)) return false;
+        out = dbg::ps4_debug_target_t::from_ps4(e);   // same 0x4A0 stop packet
+        held_ = true;
+        return true;
+    }
+    bool read(uint64_t addr, void* dst, size_t len) override {
+        if (!s_ || !s_->valid()) return false;
+        const auto io = s_->read(static_cast<uintptr_t>(addr), dst, len);
+        return io.ok && io.bytes == len;
+    }
+
+private:
+    runtime::backend_ps5_t& p_;
+    std::shared_ptr<runtime::session_t> s_;
+    std::atomic<bool> held_{true};
+};
+
+struct access_site_t {
+    uint64_t rip = 0;
+    uint64_t count = 0;
+    int64_t  first_ms = 0, last_ms = 0;   // since the session started
+    uint32_t tid = 0;
+    runtime::thread_context_t regs{};      // last hit
+    uint8_t  code[32]{};                   // bytes [rip-16, rip+16)
+    size_t   code_lo = 0, code_hi = 0;     // valid byte range in code (hi 0 = unread)
+};
+
+struct access_session_t {
+    uint64_t    id = 0, addr = 0;
+    uint32_t    len = 0, type = 0, index = 0;
+    std::string kind, debugger;
+    bool        console = false;           // commands go through the broker gate
+    int64_t     duration_ms = 0;
+    uint64_t    max_hits = 0;
+    picked_target_t pk;                    // session + console target lifetime
+    std::unique_ptr<ps5_debug_target_t> ps5;
+    std::shared_ptr<runtime::session_t> session;
+    dbg::debug_target_t* t = nullptr;
+    std::thread th;
+    std::atomic<bool> running{false};
+    std::atomic<bool> stop{false};
+    // owned by the thread until it is joined
+    bool armed = false, held_by_us = false, cleaned = false;
+    std::mutex mu;                         // guards everything below
+    std::map<uint64_t, access_site_t> sites;
+    uint64_t    hits = 0, skipped = 0, sites_dropped = 0;
+    int64_t     started_ms = 0, ended_ms = 0;   // steady clock
+    std::string stop_reason, error;
+};
+
+constexpr size_t kAccessMaxSites = 4096;
+constexpr size_t kAccessKeepSessions = 16;
+
+struct access_registry_t {
+    std::map<uint64_t, std::unique_ptr<access_session_t>> sessions;
+    uint64_t next_id = 1;
+    ~access_registry_t() {
+        for (auto& kv : sessions) {
+            kv.second->stop = true;
+            if (kv.second->th.joinable()) kv.second->th.join();
+        }
+    }
+};
+
+access_registry_t& access_reg() {
+    static access_registry_t r;   // touched under g_tool_mu only
+    return r;
+}
+
+// a console target shares one connection: take the broker gate per command,
+// but give up once a stop is requested (the stopper holds the gate and joins)
+template <class F>
+bool access_gated(access_session_t& as, F&& fn) {
+    if (!as.console) { fn(); return true; }
+    auto& g = runtime::broker_gate();
+    while (!g.try_lock()) {
+        if (as.stop.load()) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::lock_guard<std::recursive_mutex> lk(g, std::adopt_lock);
+    fn();
+    return true;
+}
+
+// never leave our watchpoint armed or the debuggee held at one of our stops
+void access_cleanup(access_session_t& as) {
+    if (as.cleaned) return;
+    as.cleaned = true;
+    if (as.armed) {
+        as.t->wp_disarm(as.addr);
+        as.armed = false;
+    }
+    if (as.held_by_us) {
+        as.t->resume();
+        as.held_by_us = false;
+    }
+}
+
+void access_record(access_session_t& as, const dbg::stop_event_t& ev, int64_t at_ms) {
+    const uint64_t rip = ev.ctx.rip;
+    bool fresh = false;
+    {
+        std::lock_guard lk(as.mu);
+        fresh = as.sites.find(rip) == as.sites.end() && as.sites.size() < kAccessMaxSites;
+    }
+    uint8_t code[32]{};
+    size_t lo = 0, hi = 0;
+    if (fresh && rip >= 16) {
+        access_gated(as, [&] {
+            if (as.t->read(rip - 16, code, 32)) { lo = 0; hi = 32; }
+            else if (as.t->read(rip, code + 16, 16)) { lo = 16; hi = 32; }
+        });
+    }
+    std::lock_guard lk(as.mu);
+    ++as.hits;
+    auto it = as.sites.find(rip);
+    if (it == as.sites.end()) {
+        if (as.sites.size() >= kAccessMaxSites) { ++as.sites_dropped; return; }
+        access_site_t s;
+        s.rip = rip;
+        s.first_ms = at_ms;
+        std::memcpy(s.code, code, sizeof(code));
+        s.code_lo = lo;
+        s.code_hi = hi;
+        it = as.sites.emplace(rip, s).first;
+    }
+    auto& s = it->second;
+    ++s.count;
+    s.last_ms = at_ms;
+    s.tid = ev.tid;
+    s.regs = ev.ctx;
+}
+
+void access_run(access_session_t& as) {
+    std::string reason = "stopped", err;
+    const int64_t t0 = as.started_ms;
+    try {
+        for (;;) {
+            if (as.stop.load()) break;
+            if (as.duration_ms > 0 && infra::steady_ms() - t0 >= as.duration_ms) {
+                reason = "duration";
+                break;
+            }
+            {
+                std::lock_guard lk(as.mu);
+                if (as.hits >= as.max_hits) { reason = "max_hits"; break; }
+            }
+            // the event queue is fed by the debugger's own thread: no gate
+            dbg::stop_event_t ev;
+            if (!as.t->wait_event(ev, 50)) {
+                if (!as.t->attached()) { reason = "detached"; break; }
+                continue;
+            }
+            if (ev.reason == "exit") { reason = "process_exited"; break; }
+            as.held_by_us = true;
+            // DR6 names the slot; a watchpoint stop without slot bits is ours too
+            const bool ours = ev.reason == "watchpoint" &&
+                              ((ev.dr[6] & (1ull << as.index)) != 0 || (ev.dr[6] & 0xF) == 0);
+            if (ours) {
+                access_record(as, ev, infra::steady_ms() - t0);
+            } else {
+                std::lock_guard lk(as.mu);
+                ++as.skipped;
+            }
+            runtime::io_result_t io;
+            if (!access_gated(as, [&] { io = as.t->resume(); })) break;
+            if (!io.ok) {
+                reason = "resume_failed";
+                err = runtime::ps4::io_error_str(io.error);
+                break;
+            }
+            as.held_by_us = false;
+        }
+    } catch (const std::exception& ex) {
+        reason = "error";
+        err = ex.what();
+    }
+    // a stop request leaves the cleanup to the joiner, which holds the gate
+    if (!as.stop.load()) access_gated(as, [&] { access_cleanup(as); });
+    {
+        std::lock_guard lk(as.mu);
+        as.stop_reason = as.stop.load() ? "stopped" : reason;
+        as.error = err;
+        as.ended_ms = infra::steady_ms();
+    }
+    as.running = false;
+}
+
+void access_stop_one(access_session_t& as) {
+    as.stop = true;
+    if (as.th.joinable()) as.th.join();
+    if (as.console) {
+        std::lock_guard g(runtime::broker_gate());
+        access_cleanup(as);
+    } else {
+        access_cleanup(as);
+    }
+}
+
+bool access_any_running() {
+    for (const auto& kv : access_reg().sessions)
+        if (kv.second->running.load()) return true;
+    return false;
+}
+
+// the debug event stream belongs to a running tracer: these actions would
+// consume its stops or drive the debuggee under it (reads stay allowed)
+void refuse_while_tracing(const std::string& action) {
+    static const char* kDrivers[] = {
+        "ps4_wait", "ps4_continue", "ps4_step", "ps4_until", "ps4_find_write",
+        "ps4_trace_calls", "ps4_trace_steps", "ps5_wait", "ps5_continue", "ps5_step",
+    };
+    if (std::none_of(std::begin(kDrivers), std::end(kDrivers),
+                     [&](const char* k) { return action == k; }))
+        return;
+    for (const auto& kv : access_reg().sessions)
+        if (kv.second->running.load())
+            fail("debugger." + action + ": access tracer " + std::to_string(kv.first) +
+                 " owns the debug event stream (debugger.access_stop {id: " +
+                 std::to_string(kv.first) + "} first)");
+}
+
+void access_stop_all() {
+    for (auto& kv : access_reg().sessions) access_stop_one(*kv.second);
+}
+
+// The instruction that touched the address. An exec watch faults on rip
+// itself; a data watch traps after the access, so every rip-k decode that ends
+// exactly at rip is a candidate and the longest one with a memory operand wins
+std::optional<disasm::insn_t> access_insn(const access_site_t& s, bool exec) {
+    auto& eng = shared_engine();
+    if (s.code_hi == 0 || (!eng.ok() && !eng.init())) return std::nullopt;
+    if (exec) return eng.decode(s.rip, s.code + 16, s.code_hi - 16);
+    std::optional<disasm::insn_t> with_mem, any;
+    for (size_t k = 1; k <= 15 && k + s.code_lo <= 16; ++k) {
+        auto in = eng.decode(s.rip - k, s.code + 16 - k, s.code_hi - (16 - k));
+        if (!in || in->length != k) continue;
+        bool mem = false;
+        for (uint8_t i = 0; i < in->op_count; ++i)
+            if (in->ops[i].cls == disasm::op_class_t::mem) mem = true;
+        if (mem) with_mem = in;
+        any = in;
+    }
+    return with_mem ? with_mem : any;
+}
+
+json access_json(access_session_t& as) {
+    std::vector<access_site_t> sites;
+    json o = {{"id", as.id}, {"addr", as.addr}, {"addr_hex", addr_hex_str(as.addr)},
+              {"len", as.len}, {"kind", as.kind}, {"debugger", as.debugger},
+              {"index", as.index}, {"duration_ms", as.duration_ms}, {"max_hits", as.max_hits},
+              {"running", as.running.load()}};
+    {
+        std::lock_guard lk(as.mu);
+        for (const auto& kv : as.sites) sites.push_back(kv.second);
+        o["hits"] = as.hits;
+        o["skipped_stops"] = as.skipped;
+        o["sites_dropped"] = as.sites_dropped;
+        o["elapsed_ms"] = (as.ended_ms ? as.ended_ms : infra::steady_ms()) - as.started_ms;
+        o["stop_reason"] = as.stop_reason.empty() ? json(nullptr) : json(as.stop_reason);
+        if (!as.error.empty()) o["error"] = as.error;
+    }
+    std::sort(sites.begin(), sites.end(), [](const access_site_t& a, const access_site_t& b) {
+        return a.count != b.count ? a.count > b.count : a.rip < b.rip;
+    });
+    std::vector<runtime::module_info_t> mods;
+    if (!sites.empty() && as.session && as.session->valid()) {
+        auto r = as.session->backend()->enum_modules(as.session->handle());
+        if (r.ok) mods = std::move(r.items);
+    }
+    const auto modoff = [&mods](uint64_t v) -> json {
+        for (const auto& m : mods)
+            if (v >= m.base && v < m.base + m.size) return m.name + "+" + addr_hex_str(v - m.base);
+        return nullptr;
+    };
+    json arr = json::array();
+    for (const auto& s : sites) {
+        json row = {{"rip", s.rip}, {"rip_hex", addr_hex_str(s.rip)}, {"rip_modoff", modoff(s.rip)},
+                    {"count", s.count}, {"first_ms", s.first_ms}, {"last_ms", s.last_ms},
+                    {"lwpid", s.tid}, {"regs", ps4_ctx_json(s.regs)}, {"disasm", nullptr}};
+        if (auto in = access_insn(s, as.type == dbg::kWatchExec)) {
+            row["disasm"] = in->text;
+            row["insn_rip"] = in->va;
+            row["insn_rip_hex"] = addr_hex_str(in->va);
+            row["insn_modoff"] = modoff(in->va);
+        }
+        arr.push_back(std::move(row));
+    }
+    o["sites"] = std::move(arr);
+    return o;
+}
+
+access_session_t& access_find(const json& args, const char* what) {
+    if (!args.contains("id")) fail(std::string(what) + " requires id (debugger.access_list)");
+    const uint64_t id = parse_addr(args, "id");
+    auto& reg = access_reg();
+    const auto it = reg.sessions.find(id);
+    if (it == reg.sessions.end())
+        fail(std::string(what) + ": no access trace " + std::to_string(id) + " (debugger.access_list)");
+    return *it->second;
+}
+
+json tool_debugger_access(const std::string& action, const json& args) {
+    auto& reg = access_reg();
+    if (action == "access_list") {
+        json arr = json::array();
+        for (auto& kv : reg.sessions) {
+            auto& as = *kv.second;
+            std::lock_guard lk(as.mu);
+            arr.push_back({{"id", as.id}, {"addr", as.addr}, {"addr_hex", addr_hex_str(as.addr)},
+                           {"len", as.len}, {"kind", as.kind}, {"debugger", as.debugger},
+                           {"running", as.running.load()}, {"hits", as.hits},
+                           {"sites", as.sites.size()},
+                           {"stop_reason", as.stop_reason.empty() ? json(nullptr)
+                                                                  : json(as.stop_reason)}});
+        }
+        return {{"sessions", std::move(arr)}};
+    }
+    if (action == "access_status") return access_json(access_find(args, "debugger.access_status"));
+    if (action == "access_stop") {
+        auto& as = access_find(args, "debugger.access_stop");
+        access_stop_one(as);
+        json o = access_json(as);
+        o["stopped"] = true;
+        return o;
+    }
+    if (action != "access_start")
+        fail("debugger: unknown access action (access_start|access_status|access_stop|access_list)");
+
+    if (access_any_running())
+        fail("debugger.access_start: an access trace is already running and owns the debug "
+             "event stream (debugger.access_stop {id} first)");
+    if (trace_sess().running.load())
+        fail("debugger.access_start: ps4_trace is running (ps4_trace_stop first)");
+    const uint64_t addr = parse_addr(args, "addr");
+    const std::string kind = args.contains("kind") && args.at("kind").is_string()
+                                 ? args.at("kind").get<std::string>() : std::string("write");
+    uint32_t type = 0;
+    if (kind == "write") type = dbg::kWatchWrite;
+    else if (kind == "access") type = dbg::kWatchReadWrite;
+    else if (kind == "exec") type = dbg::kWatchExec;
+    else fail("debugger.access_start: kind must be write|access|exec");
+    // DR7 exec breakpoints use length 1
+    const uint64_t len = type == dbg::kWatchExec ? 1 : (args.contains("len") ? parse_addr(args, "len") : 4);
+    if (len != 1 && len != 2 && len != 4 && len != 8)
+        fail("debugger.access_start: len must be 1, 2, 4 or 8");
+    if (addr % len != 0)
+        fail("debugger.access_start: addr must be aligned to len (hardware watchpoints)");
+    const int64_t duration_ms = static_cast<int64_t>(std::min<uint64_t>(
+        args.contains("duration_ms") ? parse_addr(args, "duration_ms") : 0, 86'400'000));
+    const uint64_t max_hits = std::clamp<uint64_t>(
+        args.contains("max_hits") ? parse_addr(args, "max_hits") : 100000, 1, 100'000'000);
+
+    // reap finished sessions beyond the keep window (oldest first)
+    for (auto it = reg.sessions.begin();
+         it != reg.sessions.end() && reg.sessions.size() >= kAccessKeepSessions;) {
+        if (it->second->running.load()) { ++it; continue; }
+        access_stop_one(*it->second);
+        it = reg.sessions.erase(it);
+    }
+
+    auto as = std::make_unique<access_session_t>();
+    as->session = process::active_session();
+    runtime::backend_t* b = as->session && as->session->valid() ? as->session->backend()
+                                                                : &runtime::active();
+    if (b->kind() == runtime::backend_kind_t::ps5) {
+        auto& p = need_ps5();
+        if (!p.ps5_debug_attached()) fail("debugger.access_start requires ps5_attach first");
+        as->ps5 = std::make_unique<ps5_debug_target_t>(p, as->session);
+        as->t = as->ps5.get();
+        as->console = true;
+    } else {
+        as->pk = pick_debug_target("debugger.access_start");
+        as->t = as->pk.t;
+        as->console = as->pk.p4 != nullptr;
+    }
+    as->debugger = as->t->kind();
+    as->addr = addr;
+    as->len = static_cast<uint32_t>(len);
+    as->type = type;
+    as->kind = kind;
+    as->duration_ms = duration_ms;
+    as->max_hits = max_hits;
+
+    bool reused = false;
+    auto io = as->t->wp_arm(addr, as->len, type, as->index, reused);
+    if (!io.ok) io_fail("debugger.access_start: cannot arm the watchpoint", io);
+    if (reused)
+        fail("debugger.access_start: a watchpoint is already armed at " + addr_hex_str(addr) +
+             " (ps4_watch_clear it first)");
+    as->armed = true;
+    if (as->t->stopped()) {
+        io = as->t->resume();
+        // PS5: a process that already runs refuses the continue, that is fine
+        if (!io.ok && as->debugger != "ps5") {
+            as->t->wp_disarm(addr);
+            io_fail("debugger.access_start: resume failed", io);
+        }
+    }
+    as->id = reg.next_id++;
+    as->started_ms = infra::steady_ms();
+    as->running = true;
+    access_session_t& ref = *as;
+    ref.th = std::thread([&ref] { access_run(ref); });
+    reg.sessions.emplace(ref.id, std::move(as));
+    return {{"id", ref.id}, {"addr", addr}, {"addr_hex", addr_hex_str(addr)}, {"len", len},
+            {"kind", kind}, {"index", ref.index}, {"debugger", ref.debugger},
+            {"duration_ms", duration_ms}, {"max_hits", max_hits},
+            {"note", "the target resumes after every hit; poll debugger.access_status {id}, "
+                     "debugger.access_stop {id} disarms the watchpoint"}};
+}
+
 bool is_composite(const std::string& action) {
     return action == "ps4_until" || action == "ps4_find_write" ||
            action == "ps4_trace_calls" || action == "ps4_trace_steps";
@@ -2613,6 +3112,9 @@ bool is_composite(const std::string& action) {
 
 json tool_debugger(const json& args) {
     const std::string action = require_action(args);
+    // continuous access tracer: local Win32 debugger, PS4 or PS5 console
+    if (action.rfind("access_", 0) == 0) return tool_debugger_access(action, args);
+    refuse_while_tracing(action);
     // the composite flows run on the console debugger, or on the local
     // Win32 debugger when the attached session is a local test-lab process
     if (is_composite(action)) return tool_debugger_composite(action, args);
@@ -2623,6 +3125,8 @@ json tool_debugger(const json& args) {
     if (action == "ps4_detach" && !runtime::registry_ps4()) {
         // local debugger session (composites on a test-lab process)
         auto& d = local_debugger();
+        trace_stop_join();   // both threads use the debugger being detached
+        access_stop_all();
         const bool was = d.attached();
         d.detach();
         g_bp_rules.clear();
@@ -2680,6 +3184,15 @@ json tool_debugger(const json& args) {
 
 void clear_breakpoint_conditions() {
     trace_stop_join();
+    access_stop_all();
+    g_bp_rules.clear();
+}
+
+void release_local_debugger() {
+    trace_stop_join();   // both threads use the debugger being detached
+    access_stop_all();
+    auto& d = local_debugger();
+    if (d.attached()) d.detach();
     g_bp_rules.clear();
 }
 

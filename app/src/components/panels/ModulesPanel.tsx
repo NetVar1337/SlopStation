@@ -14,6 +14,7 @@ import { call, errorText } from "@/lib/rpc";
 import { hex, useDisasm } from "@/store/disasm";
 import { useEngine } from "@/store/engine";
 import { useTargets } from "@/store/targets";
+import { useUi } from "@/store/ui";
 
 const kRow = 22;
 
@@ -36,6 +37,7 @@ function dumpFileName(name: string, base: number, ps4: boolean): string {
 export default function ModulesPanel() {
   const t = useT();
   const target = useEngine((s) => s.target);
+  const setRail = useUi((s) => s.setRail);
   const ps4 = useEngine((s) => s.backend.ps4);
   // The engine store refreshes this list on every target.changed
   const modules = useTargets((s) => s.modules);
@@ -115,6 +117,9 @@ export default function ModulesPanel() {
         </div>
         <div className="empty">
           <div className="empty-hint">{t("modules.empty")}</div>
+          <button type="button" className="row-action" onClick={() => setRail("targets")}>
+            {t("titlebar.attachToProcess")}
+          </button>
         </div>
       </div>
     );

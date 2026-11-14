@@ -16,9 +16,9 @@ type DotState = "ok" | "busy" | "bad" | "idle";
 
 function Pill({ label, state }: { label: string; state: DotState }) {
   return (
-    <span className="status-pill">
+    <span className="status-pill" data-tip={label}>
       <span className="dot" data-state={state} aria-hidden />
-      {label}
+      <span className="status-text">{label}</span>
     </span>
   );
 }
@@ -69,14 +69,16 @@ export default function StatusBar() {
         : t("status.engineRestarting")
       : t("status.engineOffline");
 
+  const targetLabel = target.attached
+    ? `${target.name ?? t("status.unknownTarget")} (${target.pid ?? 0})`
+    : connected
+      ? t("status.ready")
+      : t("status.disconnected");
+
   return (
     <footer className="statusbar" aria-label={t("status.label")}>
-      <span role="status">
-        {target.attached
-          ? `${target.name ?? t("status.unknownTarget")} (${target.pid ?? 0})`
-          : connected
-            ? t("status.ready")
-            : t("status.disconnected")}
+      <span role="status" className="status-target" data-tip={targetLabel}>
+        {targetLabel}
       </span>
 
       <div className="spacer" />
@@ -92,7 +94,9 @@ export default function StatusBar() {
             onClick={() => setConsoleMenu((v) => !v)}
           >
             <span className="dot" data-state={activeConsole === "" ? "idle" : "ok"} aria-hidden />
-            {activeConsole === "" ? t("status.noConsole") : activeConsole}
+            <span className="status-text">
+              {activeConsole === "" ? t("status.noConsole") : activeConsole}
+            </span>
           </button>
           {consoleMenu && (
             <div

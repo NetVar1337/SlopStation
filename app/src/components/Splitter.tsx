@@ -11,7 +11,7 @@ import {
   type KeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { kLayoutVars, useUi, type LayoutVar } from "@/store/ui";
+import { defaultLayoutSize, useUi, type LayoutVar } from "@/store/ui";
 
 /**
  * Read-only view of a ref. Splitter only reads `current`, never writes it, so
@@ -40,8 +40,9 @@ export default function Splitter({ axis, variable, target, min, max, invert, lab
   const dragging = useRef(false);
   const ref = useRef<HTMLDivElement>(null);
   const stored = useUi((s) => s.sizes[variable]);
+  const fallback = useUi((s) => defaultLayoutSize(variable, s.viewportW, s.viewportH));
   const setSize = useUi((s) => s.setSize);
-  const [value, setValue] = useState<number>(stored ?? kLayoutVars[variable]);
+  const [value, setValue] = useState<number>(stored ?? fallback);
 
   const host = useCallback(() => target?.current ?? document.documentElement, [target]);
 
@@ -58,8 +59,8 @@ export default function Splitter({ axis, variable, target, min, max, invert, lab
   // The persisted size itself is applied by the shell (App.tsx); mirror it for
   // aria-valuenow, including after Reset layout
   useEffect(() => {
-    setValue(stored ?? kLayoutVars[variable]);
-  }, [stored, variable]);
+    setValue(stored ?? fallback);
+  }, [stored, fallback]);
 
   const current = () => parseFloat(getComputedStyle(host()).getPropertyValue(variable)) || value;
 
@@ -124,7 +125,7 @@ export default function Splitter({ axis, variable, target, min, max, invert, lab
       aria-valuemax={max}
       onPointerDown={onPointerDown}
       onKeyDown={onKeyDown}
-      onDoubleClick={() => apply(kLayoutVars[variable], true)}
+      onDoubleClick={() => apply(fallback, true)}
     />
   );
 }

@@ -9,6 +9,7 @@ import { useT } from "@/i18n";
 import type { Key } from "@/i18n/en";
 import { openBinary } from "@/lib/openBinary";
 import { browserLabel, hex, parseAddress } from "@/lib/format";
+import { listGuides, type GuideTopic } from "@/lib/guide";
 import { loadHelpIndex, openHelp, searchHelp, type HelpEntry } from "@/lib/help";
 import { functionLabel, useDisasm, type FunctionRow } from "@/store/disasm";
 import { useDecomp } from "@/store/decomp";
@@ -46,6 +47,10 @@ export default function CommandPalette() {
   const inspectorOpen = useUi((s) => s.inspectorOpen);
   const setInspectorOpen = useUi((s) => s.setInspectorOpen);
   const resetLayout = useUi((s) => s.resetLayout);
+  const scannerOpen = useUi((s) => s.scannerOpen);
+  const setScannerOpen = useUi((s) => s.setScannerOpen);
+  const openGuide = useUi((s) => s.openGuide);
+  const engineUp = useEngine((s) => s.boot.done);
   const image = useDisasm((s) => s.image);
   const searchFunctions = useDisasm((s) => s.searchFunctions);
   const attached = useEngine((s) => s.target.attached);
@@ -53,6 +58,7 @@ export default function CommandPalette() {
   const [query, setQuery] = useState("");
   const [found, setFound] = useState<FunctionRow[]>([]);
   const [help, setHelp] = useState<HelpEntry[]>([]);
+  const [guides, setGuides] = useState<GuideTopic[]>([]);
 
   useEffect(() => {
     if (!open) setQuery("");
@@ -68,6 +74,18 @@ export default function CommandPalette() {
       alive = false;
     };
   }, [open]);
+
+  // Guide topics come from the engine; an offline engine just hides the group
+  useEffect(() => {
+    if (!open || !engineUp) return;
+    let alive = true;
+    listGuides()
+      .then((list) => alive && setGuides(list))
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [open, engineUp]);
 
   const helpHits = useMemo(() => searchHelp(help, query.trim(), kHelpLimit), [help, query]);
 
@@ -178,6 +196,13 @@ export default function CommandPalette() {
         label: t(inspectorOpen ? "titlebar.hideInspector" : "titlebar.showInspector"),
         run: () => setInspectorOpen(!inspectorOpen),
       },
+      {
+        id: "scanner",
+        group: "actions",
+        label: t(scannerOpen ? "titlebar.hideScanner" : "titlebar.showScanner"),
+        run: () => setScannerOpen(!scannerOpen),
+      },
+      { id: "guides", group: "actions", label: t("guide.menu"), run: () => openGuide("") },
       { id: "layout", group: "actions", label: t("titlebar.resetLayout"), run: resetLayout },
       {
         id: "reload",
@@ -200,6 +225,9 @@ export default function CommandPalette() {
       inspectorOpen,
       openSettings,
       setInspectorOpen,
+      scannerOpen,
+      setScannerOpen,
+      openGuide,
       resetLayout,
       setTheme,
       t,
@@ -299,6 +327,21 @@ export default function CommandPalette() {
               >
                 <span>{e.title}</span>
                 <span className="palette-hint">{e.path.replace(/\.md$/, "")}</span>
+              </Command.Item>
+            ))}
+          </Command.Group>
+        )}
+
+        {guides.length > 0 && (
+          <Command.Group heading={t("guide.palette")}>
+            {guides.map((g) => (
+              <Command.Item
+                key={g.topic}
+                value={`guide ${g.title} ${g.topic} ${g.summary}`}
+                onSelect={() => openGuide(g.topic)}
+              >
+                <span>{g.title}</span>
+                <span className="palette-hint mono">{g.topic}</span>
               </Command.Item>
             ))}
           </Command.Group>

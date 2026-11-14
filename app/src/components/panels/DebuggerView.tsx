@@ -1,12 +1,14 @@
 // app/src/components/panels/DebuggerView.tsx
 // PS4 live-debug panel: attach state, run control, breakpoints/watchpoints,
 // registers, callstack, event feed - every action goes over the ps4debug-NG
-// wire via the debugger ps4_* MCP actions
+// wire via the debugger ps4_* MCP actions. The access tracer below it also
+// serves a local Windows target, which gets only that section
 
 import { useEffect, useState } from "react";
 import { Ban, FolderOpen, Gamepad2, Play, Plus, StepForward, Timer } from "lucide-react";
 import { save } from "@tauri-apps/plugin-dialog";
 import IconButton from "@/components/IconButton";
+import AccessTracer from "@/components/panels/AccessTracer";
 import { useT } from "@/i18n";
 import { isTauri } from "@/lib/endpoint";
 import { hex, parseAddress } from "@/lib/format";
@@ -102,16 +104,29 @@ export default function DebuggerView() {
   const pid = target.pid ?? status.debug_pid;
 
   if (!backend.ps4) {
-    return (
-      <div className="empty">
-        <div className="empty-glyph">
-          <Gamepad2 size={28} strokeWidth={1.5} />
-        </div>
+    const consoleHint = (
+      <>
         <div className="empty-title">{t("debugger.noConsole")}</div>
         <div className="empty-hint">{t("debugger.noConsoleHint")}</div>
         <button type="button" className="row-action" onClick={() => setRail("targets")}>
           {t("debugger.openTargets")}
         </button>
+      </>
+    );
+    // a local process still gets "what writes/accesses this" through the tracer
+    if (target.attached)
+      return (
+        <div className="lm-dbg-local">
+          <div className="lm-dbg-local-hint">{consoleHint}</div>
+          <AccessTracer />
+        </div>
+      );
+    return (
+      <div className="empty">
+        <div className="empty-glyph">
+          <Gamepad2 size={28} strokeWidth={1.5} />
+        </div>
+        {consoleHint}
       </div>
     );
   }
@@ -729,6 +744,7 @@ export default function DebuggerView() {
           </div>
         </div>
       </div>
+      <AccessTracer />
     </div>
   );
 }

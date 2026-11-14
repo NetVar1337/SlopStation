@@ -5,6 +5,7 @@ import { useEffect, useRef } from "react";
 import { FolderOpen, RotateCcw, X } from "lucide-react";
 import ActivityRail from "@/components/ActivityRail";
 import CommandPalette from "@/components/CommandPalette";
+import GuideModal from "@/components/GuideModal";
 import IconButton from "@/components/IconButton";
 import SettingsModal from "@/components/SettingsModal";
 import Splash from "@/components/Splash";
@@ -25,7 +26,7 @@ import { useShortcuts } from "@/lib/shortcuts";
 import { openPath } from "@/lib/shell";
 import { useEngine } from "@/store/engine";
 import { useOutput } from "@/store/output";
-import { kLayoutVars, useUi, type LayoutVar } from "@/store/ui";
+import { defaultLayoutSize, kLayoutVars, useUi, type LayoutVar } from "@/store/ui";
 import { useUpdater } from "@/store/updater";
 import { useWatch } from "@/store/watch";
 
@@ -141,24 +142,34 @@ export default function App() {
   const openSettings = useUi((s) => s.openSettings);
   const closeSettings = useUi((s) => s.closeSettings);
   const inspectorOpen = useUi((s) => s.inspectorOpen);
+  const scannerOpen = useUi((s) => s.scannerOpen);
+  const guideTopic = useUi((s) => s.guideTopic);
   const appRef = useRef<HTMLDivElement>(null);
   const boot = useEngine((s) => s.boot);
   const start = useEngine((s) => s.start);
   const attachOutput = useOutput((s) => s.attach);
   const attachWatch = useWatch((s) => s.attach);
   const sizes = useUi((s) => s.sizes);
+  const viewportW = useUi((s) => s.viewportW);
+  const viewportH = useUi((s) => s.viewportH);
+
+  useEffect(() => {
+    const onResize = () => useUi.getState().onViewport(window.innerWidth, window.innerHeight);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   // Persisted splitter sizes drive the grid's CSS variables; an unset entry
-  // (fresh install, Reset layout) falls back to the stylesheet default
+  // (fresh install, Reset layout) follows the window so small screens keep a
+  // usable workspace
   useEffect(() => {
     const root = appRef.current;
     if (root === null) return;
     for (const key of Object.keys(kLayoutVars) as LayoutVar[]) {
-      const px = sizes[key];
-      if (px === undefined) root.style.removeProperty(key);
-      else root.style.setProperty(key, `${px}px`);
+      const px = sizes[key] ?? defaultLayoutSize(key, viewportW, viewportH);
+      root.style.setProperty(key, `${px}px`);
     }
-  }, [sizes]);
+  }, [sizes, viewportW, viewportH]);
 
   useShortcuts();
 
@@ -225,16 +236,20 @@ export default function App() {
             />
 
             <div className="center-col">
-              <div className="center-top">
-                <ScannerPanel />
-                <Splitter
-                  axis="x"
-                  variable="--scan-w"
-                  target={appRef}
-                  min={220}
-                  max={620}
-                  label={t("app.resizeScanner")}
-                />
+              <div className="center-top" data-scanner={scannerOpen ? "open" : "closed"}>
+                {scannerOpen && (
+                  <>
+                    <ScannerPanel />
+                    <Splitter
+                      axis="x"
+                      variable="--scan-w"
+                      target={appRef}
+                      min={220}
+                      max={620}
+                      label={t("app.resizeScanner")}
+                    />
+                  </>
+                )}
                 <WorkspacePanel />
               </div>
               <Splitter
@@ -270,6 +285,7 @@ export default function App() {
       <StatusBar />
       {settingsOpen && <SettingsModal onClose={closeSettings} />}
       <CommandPalette />
+      {guideTopic !== null && <GuideModal topic={guideTopic} />}
       <TooltipLayer />
     </div>
   );

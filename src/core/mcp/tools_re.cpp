@@ -1,19 +1,261 @@
 // src/core/mcp/tools_re.cpp
-// tool: re (rtti, vtables, danger imports, libsig, symbols)
+// tool: re (rtti, vtables, danger imports, libsig, symbols, il2cpp/unreal dumpers)
 
 #include "core/mcp/tools_common.hpp"
 
+#include "core/infra/paths.hpp"
 #include "core/loader/elf_loader.h"
+#include "core/memory/session_reader.hpp"
+#include "core/re/il2cpp_dump.hpp"
+#include "core/re/ue_dump.hpp"
 
 #include <cstring>
 
 namespace slop::core::mcp::detail {
 
 
+namespace {
+
+namespace il2cpp = slop::core::re::il2cpp;
+namespace ue = slop::core::re::ue;
+
+std::vector<uint8_t> read_host_file(const std::string& path, uint64_t cap, const char* what) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) fail(std::string("cannot open ") + what + ": " + path);
+    const std::streamoff size = f.tellg();
+    if (size <= 0 || static_cast<uint64_t>(size) > cap)
+        fail(std::string(what) + " is empty or larger than " + std::to_string(cap >> 20) + " MiB: " + path);
+    std::vector<uint8_t> data(static_cast<size_t>(size));
+    f.seekg(0);
+    if (!f.read(reinterpret_cast<char*>(data.data()), size)) fail(std::string("short read on ") + what + ": " + path);
+    return data;
+}
+
+// format: string or array of strings out of `allowed`; absent = all of them
+std::unordered_set<std::string> parse_formats(const json& args, std::initializer_list<const char*> allowed,
+                                              const char* action) {
+    std::unordered_set<std::string> out;
+    std::string list;
+    for (const char* a : allowed) list += (list.empty() ? "" : "|") + std::string(a);
+    if (!args.contains("format")) {
+        for (const char* a : allowed) out.insert(a);
+        return out;
+    }
+    const json& f = args.at("format");
+    std::vector<std::string> items;
+    if (f.is_string()) items.push_back(f.get<std::string>());
+    else if (f.is_array()) {
+        for (const auto& e : f) {
+            if (!e.is_string()) fail(std::string(action) + ": format entries must be strings (" + list + ")");
+            items.push_back(e.get<std::string>());
+        }
+    } else {
+        fail(std::string(action) + ": format must be a string or an array of strings (" + list + ")");
+    }
+    for (const auto& it : items) {
+        bool ok = false;
+        for (const char* a : allowed) ok = ok || it == a;
+        if (!ok) fail(std::string(action) + ": unknown format '" + it + "' (" + list + ")");
+        out.insert(it);
+    }
+    if (out.empty()) fail(std::string(action) + ": format selects nothing (" + list + ")");
+    return out;
+}
+
+std::string require_out_dir(const json& args, const char* action) {
+    const std::string dir = args.value("out_dir", std::string{});
+    if (dir.empty()) fail(std::string(action) + " requires 'out_dir' (host folder for the output files)");
+    return dir;
+}
+
+std::string write_out(const std::string& dir, const std::string& name, const std::string& body) {
+    const char last = dir.back();
+    const std::string path = dir + (last == '/' || last == '\\' ? "" : "/") + name;
+    if (!infra::paths::write_file_atomic(path, body)) fail("cannot write " + path);
+    return path;
+}
+
+bool same_name(const std::string& a, const std::string& b) { return _stricmp(a.c_str(), b.c_str()) == 0; }
+
+// a loaded module of the active target: its mapped span (gaps zero-filled)
+// plus the segment map when the backend reports one (console modules)
+struct live_module_t {
+    uint64_t base = 0;
+    std::string name;
+    std::vector<process::mapped_segment_t> segs;
+};
+
+live_module_t find_live_module(runtime::session_t& s, const std::string& want) {
+    live_module_t m;
+    if (auto* p4 = dynamic_cast<runtime::backend_ps4_t*>(s.backend()); p4 && p4->connected()) {
+        auto mods = p4->ps4_modules(s.handle());
+        if (!mods.ok) fail("module enumeration failed on the console: " + runtime::ps4::io_error_str(mods.error));
+        for (const auto& pm : mods.items) {
+            if (!(want.empty() ? same_name(pm.name, "eboot.bin") : same_name(pm.name, want))) continue;
+            m.base = pm.base;
+            m.name = pm.name;
+            for (const auto& sg : pm.segments) m.segs.push_back({sg.start, sg.end, sg.prot});
+            return m;
+        }
+    } else {
+        auto mods = runtime::active().enum_modules(s.handle());
+        if (!mods.ok) fail("module enumeration failed");
+        for (const auto& lm : mods.items) {
+            if (!want.empty() && !same_name(lm.name, want)) continue;
+            m.base = lm.base;
+            m.name = lm.name;
+            m.segs.push_back({lm.base, lm.base + lm.size, 7});
+            return m;
+        }
+    }
+    fail(want.empty() ? "no main module found on the target" : "module '" + want + "' is not loaded in the target");
+}
+
+std::vector<uint8_t> read_live_span(runtime::session_t& s, const live_module_t& m, std::vector<std::string>& warnings) {
+    process::module_dump_options_t o;
+    o.chunk_size = 256u * 1024u;
+    o.strict_reads = false;
+    auto read = [&s](uintptr_t a, void* dst, size_t n) { return s.read(a, dst, n); };
+    std::vector<uint8_t> span;
+    const auto r = process::dump_raw_span(m.segs, read, span, o);
+    if (!r.ok) fail("reading module " + m.name + " failed: " + r.error);
+    warnings.insert(warnings.end(), r.warnings.begin(), r.warnings.end());
+    return span;
+}
+
+json il2cpp_dump_action(const json& args) {
+    const std::string meta_path = args.value("metadata", std::string{});
+    if (meta_path.empty()) fail("il2cpp_dump requires 'metadata' (path to global-metadata.dat)");
+    const std::string out_dir = require_out_dir(args, "il2cpp_dump");
+    const auto formats = parse_formats(args, {"cs", "json", "header"}, "il2cpp_dump");
+    const std::string bin_path = args.value("binary", std::string{});
+    const std::string module = args.value("module", std::string{});
+    if (bin_path.empty() == module.empty())
+        fail("il2cpp_dump requires exactly one of 'binary' (GameAssembly.dll / libil2cpp.so / decrypted PRX "
+             "or dumped ELF on disk) or 'module' (a module loaded in the active target)");
+
+    const auto metadata = read_host_file(meta_path, 512ull << 20, "metadata");
+    std::vector<std::string> pre_warnings;
+    il2cpp::binary_image_t img;
+    std::string err;
+    json source;
+    if (!bin_path.empty()) {
+        if (!il2cpp::image_from_file(read_host_file(bin_path, 2048ull << 20, "binary"), img, err, pre_warnings))
+            fail("il2cpp_dump: " + err);
+        source = {{"binary", bin_path}, {"format", img.format}, {"image_base", img.image_base}};
+    } else {
+        const auto s_hold = need_session();
+        auto& s = *s_hold;
+        const live_module_t m = find_live_module(s, module);
+        std::vector<il2cpp::image_segment_t> segs;
+        if (m.segs.size() > 1 || dynamic_cast<runtime::backend_ps4_t*>(s.backend()))
+            for (const auto& sg : m.segs) {
+                il2cpp::image_segment_t is;
+                is.va = sg.start;
+                is.size = sg.end - sg.start;
+                is.exec = (sg.prot & 4) != 0;
+                segs.push_back(is);
+            }
+        if (!il2cpp::image_from_memory(read_live_span(s, m, pre_warnings), m.base, std::move(segs), img, err))
+            fail("il2cpp_dump: " + err);
+        source = {{"module", m.name}, {"base", m.base}, {"size", img.bytes.size()}};
+    }
+
+    il2cpp::dump_options_t o;
+    o.cs = formats.count("cs") != 0;
+    o.json = formats.count("json") != 0;
+    o.header = formats.count("header") != 0;
+    auto r = il2cpp::dump(metadata, img, o);
+    if (!r.ok) fail("il2cpp_dump: " + r.error);
+    json files = json::array();
+    if (o.cs) files.push_back(write_out(out_dir, "dump.cs", r.dump_cs));
+    if (o.json) files.push_back(write_out(out_dir, "il2cpp.json", r.il2cpp_json));
+    if (o.header && !r.il2cpp_h.empty()) files.push_back(write_out(out_dir, "il2cpp.h", r.il2cpp_h));
+    pre_warnings.insert(pre_warnings.end(), r.warnings.begin(), r.warnings.end());
+    return {{"version", r.version}, {"images", r.images}, {"types", r.types}, {"methods", r.methods},
+            {"fields", r.fields}, {"methods_with_address", r.methods_with_address},
+            {"generic_instances", r.generic_instances}, {"code_registration", r.code_registration},
+            {"metadata_registration", r.metadata_registration}, {"source", source},
+            {"out_files", files}, {"warnings", pre_warnings}};
+}
+
+// writable sections of a module (where FNamePool / GUObjectArray live)
+std::vector<ue::range_t> ue_scan_ranges(runtime::session_t& s, const live_module_t& m) {
+    std::vector<ue::range_t> out;
+    if (m.segs.size() > 1 || dynamic_cast<runtime::backend_ps4_t*>(s.backend())) {
+        for (const auto& sg : m.segs)
+            if ((sg.prot & 2) && sg.end > sg.start) out.push_back({sg.start, sg.end - sg.start});
+    } else {
+        uint8_t hdr[0x1000] = {};
+        uint32_t lfanew = 0, sig = 0;
+        uint16_t nsec = 0, opt = 0;
+        if (s.read(m.base, hdr, sizeof hdr).ok && hdr[0] == 'M' && hdr[1] == 'Z') {
+            std::memcpy(&lfanew, hdr + 0x3C, 4);
+            if (lfanew < 0xF00) {
+                std::memcpy(&sig, hdr + lfanew, 4);
+                std::memcpy(&nsec, hdr + lfanew + 6, 2);
+                std::memcpy(&opt, hdr + lfanew + 20, 2);
+            }
+        }
+        const uint64_t sec0 = uint64_t{lfanew} + 24 + opt;
+        for (uint32_t i = 0; sig == 0x00004550u && i < nsec && sec0 + 40ull * (i + 1) <= sizeof hdr; ++i) {
+            uint32_t vsize = 0, rva = 0, chars = 0;
+            std::memcpy(&vsize, hdr + sec0 + 40ull * i + 8, 4);
+            std::memcpy(&rva, hdr + sec0 + 40ull * i + 12, 4);
+            std::memcpy(&chars, hdr + sec0 + 40ull * i + 36, 4);
+            if ((chars & 0x80000000u) && vsize) out.push_back({m.base + rva, vsize});   // IMAGE_SCN_MEM_WRITE
+        }
+        if (out.empty() && !m.segs.empty()) out.push_back({m.segs[0].start, m.segs[0].end - m.segs[0].start});
+    }
+    return out;
+}
+
+json ue_dump_action(const json& args) {
+    const std::string out_dir = require_out_dir(args, "ue_dump");
+    const auto formats = parse_formats(args, {"json", "sdk"}, "ue_dump");
+    ue::dump_options_t o;
+    const std::string ver = args.value("version", std::string("auto"));
+    if (ver == "4.x" || ver == "4") o.version_hint = 4;
+    else if (ver == "5.x" || ver == "5") o.version_hint = 5;
+    else if (ver != "auto") fail("ue_dump: version must be auto, 4.x or 5.x");
+    if (args.contains("gnames")) o.gnames = parse_addr(args, "gnames");
+    if (args.contains("gobjects")) o.gobjects = parse_addr(args, "gobjects");
+    if (args.contains("max_objects")) {
+        const uint64_t mo = parse_addr(args, "max_objects");
+        if (mo == 0 || mo > 20'000'000) fail("ue_dump: max_objects must be 1..20000000");
+        o.max_objects = static_cast<size_t>(mo);
+    }
+    o.json = formats.count("json") != 0;
+    o.sdk = formats.count("sdk") != 0;
+
+    const auto s_hold = need_session();
+    auto& s = *s_hold;
+    json scanned = json::array();
+    if (!o.gnames || !o.gobjects) {
+        const live_module_t m = find_live_module(s, args.value("module", std::string{}));
+        o.scan = ue_scan_ranges(s, m);
+        for (const auto& r : o.scan) scanned.push_back({{"base", r.base}, {"size", r.size}});
+        if (o.scan.empty()) fail("ue_dump: module " + m.name + " has no writable sections to search; pass gnames and gobjects");
+    }
+    memory::session_reader_t reader(s);
+    auto r = ue::dump(reader, o);
+    if (!r.ok) fail("ue_dump: " + r.error);
+    json files = json::array();
+    for (const auto& [name, body] : r.files) files.push_back(write_out(out_dir, name, body));
+    return {{"version", r.version}, {"gnames", r.gnames}, {"gobjects", r.gobjects}, {"names", r.names},
+            {"objects", r.objects}, {"classes", r.classes}, {"structs", r.structs}, {"enums", r.enums},
+            {"functions", r.functions}, {"scanned", scanned}, {"out_files", files}, {"warnings", r.warnings}};
+}
+
+} // namespace
+
 // tool: re
 
 json tool_re(const json& args) {
     const std::string action = require_action(args);
+    // engine-metadata dumpers work on host files / the live target, not the shared image
+    if (action == "il2cpp_dump") return il2cpp_dump_action(args);
+    if (action == "ue_dump") return ue_dump_action(args);
 
     // app loaded binary unless a path is given
     std::optional<ds::binary_lock_t> shared_lock;
@@ -268,7 +510,7 @@ json tool_re(const json& args) {
         return out;
     }
 
-    fail("re: unknown action (rtti_scan|vftable|danger|libsig)");
+    fail("re: unknown action (rtti_scan|vftable|danger|libsig|il2cpp_dump|ue_dump)");
 }
 
 } // namespace slop::core::mcp::detail

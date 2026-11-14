@@ -93,18 +93,30 @@ npm run tauri dev     # the desktop app: Vite dev server + Tauri shell + engine
 ### Browser dev mode
 
 `npm run dev` serves the UI on http://localhost:1420 without the shell. It
-then connects to whatever engine listens on `127.0.0.1:8765` with no token and
-no handshake, and the title bar shows an **insecure dev mode** badge: nothing
-proves that listener is the engine. Start one yourself
-(`reverse-slop-engine.exe` with the MCP server on its default port); its CORS
-allow-list already includes `http://localhost:1420` and `http://127.0.0.1:1420`.
-For an engine on another port or with an MCP token, put them in
-`app/.env.local` (ignored by `app/.gitignore`; never commit a token):
+connects to the engine at `127.0.0.1:<VITE_SLOP_PORT>` (default 8765) with
+the bearer token in `VITE_SLOP_TOKEN`, without the shell's handshake, so the
+title bar shows an **insecure dev mode** badge: nothing proves that listener is
+the engine. The engine always requires a token (there is no tokenless mode).
+Start it yourself with a token of your choice; `SLOP_MCP_TOKEN` adds it for that
+process without persisting anything:
+
+```powershell
+$env:SLOP_MCP_TOKEN = "dev-token"
+reverse-slop-engine.exe --port 8765
+```
+
+Then put the same values in `app/.env.local` (ignored by `app/.gitignore`;
+never commit a token) and run `npm run dev`:
 
 ```sh
 VITE_SLOP_PORT=8765
-VITE_SLOP_TOKEN=<the engine's mcp_token>
+VITE_SLOP_TOKEN=dev-token
 ```
+
+Alternatively use the persisted token: `mcp_token` in
+`%LOCALAPPDATA%\reverse-slop\settings.json`, also printed on the engine's
+`SLOP_ENGINE_READY <port> <token>` line. The engine's CORS allow-list already
+includes `http://localhost:1420` and `http://127.0.0.1:1420`.
 
 ## Scripts
 

@@ -15,10 +15,10 @@ export const kDefaultStartupDeadlineMs = 180_000;
 export const isTauri = (): boolean => typeof window !== "undefined" && inTauri();
 
 /**
- * Browser dev mode connects to whatever answers on 127.0.0.1:8765 without a
- * handshake. The engine only accepts a tokenless request when it was started
- * with --insecure-dev (audit 103), so nothing proves that listener is ours and
- * the shell shows a visible badge while it is in effect.
+ * Browser dev mode connects to whatever answers on 127.0.0.1:VITE_SLOP_PORT
+ * without a handshake, using VITE_SLOP_TOKEN (the engine always requires a
+ * token; there is no tokenless mode), so nothing proves that listener is ours
+ * and the shell shows a visible badge while it is in effect.
  */
 export const isInsecureDev = (): boolean => !isTauri();
 

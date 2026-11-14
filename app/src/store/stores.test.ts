@@ -10,7 +10,14 @@ import { kFlushMs, useOutput } from "@/store/output";
 import { readShowHost, useTargets } from "@/store/targets";
 import { kThemes, useTheme } from "@/store/theme";
 import { useMotion } from "@/store/motion";
-import { layoutChanges, layoutFile, parseLayout, parseLayoutFile, useUi } from "@/store/ui";
+import {
+  defaultLayoutSize,
+  layoutChanges,
+  layoutFile,
+  parseLayout,
+  parseLayoutFile,
+  useUi,
+} from "@/store/ui";
 import { useWatch } from "@/store/watch";
 import { useTypes } from "@/store/types";
 import * as events from "@/lib/events";
@@ -438,6 +445,25 @@ describe("layout + themes (items 107, 116, 117)", () => {
     expect(parseLayout(JSON.stringify({ rail: "bogus", sizes: { "--left-w": -5 } })).sizes).toEqual(
       {},
     );
+    useUi.getState().resetLayout();
+  });
+
+  it("adapts default panel sizes and auto-collapses an unpinned inspector", () => {
+    expect(defaultLayoutSize("--left-w", 1100, 680)).toBe(220);
+    expect(defaultLayoutSize("--left-w", 1680, 980)).toBe(300);
+    expect(defaultLayoutSize("--scan-w", 1366, 768)).toBe(273);
+    expect(defaultLayoutSize("--bottom-h", 1100, 680)).toBe(184);
+    // an old blob always wrote inspectorOpen=true: that is not a user choice
+    expect(parseLayout(JSON.stringify({ inspectorOpen: true })).inspectorPinned).toBe(false);
+    expect(parseLayout(JSON.stringify({ inspectorOpen: false })).inspectorPinned).toBe(true);
+    useUi.getState().resetLayout();
+    useUi.getState().onViewport(1100, 680);
+    expect(useUi.getState().inspectorOpen).toBe(false);
+    useUi.getState().onViewport(1680, 980);
+    expect(useUi.getState().inspectorOpen).toBe(true);
+    useUi.getState().setInspectorOpen(false);
+    useUi.getState().onViewport(1920, 1080);
+    expect(useUi.getState().inspectorOpen).toBe(false);
     useUi.getState().resetLayout();
   });
 

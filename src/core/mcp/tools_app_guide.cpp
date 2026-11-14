@@ -361,14 +361,46 @@ const std::vector<guide_topic_t>& guide_table() {
           {"devirt", "recover_cfg", R"({"addr":<func>})", "rebuild the CFG"},
           {"decomp", "function", R"({"function_va":<func>})", "decompile after recovery"}}},
         {"ps4_unpack_runtime", "Dump the unpacked game from the PS4 after it unpacks in memory",
-         "Packed code unpacks itself at runtime on the console: break at the OEP (entry entropy spike), then read the whole module range over the wire and save it on the host for static analysis.",
+         "Packed code unpacks itself at runtime on the console: break at the OEP (entry entropy spike), then stream the whole module range to a host file for static analysis.",
          {{"target", "modules", "{}", "game module base + size on the console"},
           {"debugger", "ps4_bp_set", R"({"addr":<oep>})", "break at the unpacked entry"},
           {"debugger", "ps4_continue", "{}", "let it unpack"},
           {"debugger", "ps4_wait", R"({"timeout_ms":60000})", "wait for the OEP hit"},
-          {"memory", "read", R"({"addr":<image_base>,"len":<module_size>,"format":"hex"})", "pull the unpacked image over the ps4debug wire"},
-          {"fs", "write_file", R"({"path":"unpacked.bin","hex":"<hex>"})", "save it on the host"},
-          {"analyze", "packer", R"({"path":"unpacked.bin"})", "verify it is unpacked now"}}},
+          {"target", "ps4_dump_module", R"({"base":<image_base>,"path":"C:/dumps/unpacked.elf","format":"elf","load":true})", "rebuild an ELF at the runtime VAs and load it"},
+          {"memory", "dump", R"({"addr":<image_base>,"len":<module_size>,"path":"C:/dumps/unpacked.bin"})", "or the raw span, unreadable pages zero-filled"},
+          {"analyze", "packer", R"({"path":"C:/dumps/unpacked.bin"})", "verify it is unpacked now"}}},
+        {"find_what_accesses", "Find every instruction that writes or reads an address (continuous)",
+         "access_start arms a hardware watchpoint and keeps the target running, counting every instruction that touches the address until you stop it - Cheat Engine's 'find out what writes/accesses this address'. Works on local Windows processes and on the PS4.",
+         {{"memory", "scan", R"({"kind":"exact","width":"u32","value":100})", "find the value first"},
+          {"debugger", "access_start", R"({"addr":<hit>,"len":4,"kind":"write"})", "kind write | access | exec"},
+          {"debugger", "access_status", R"({"id":<id>})", "sites[] by hit count: rip, module+offset, disasm, last registers"},
+          {"debugger", "access_stop", R"({"id":<id>})", "disarm and keep the final site table"},
+          {"disasm", "disassemble", R"({"addr":<rip>,"count":16})", "read the code around the hottest writer"}}},
+        {"watch_over_time", "Watch values change over time and keep their history",
+         "watch_add samples an address on the engine tick; watch_history returns the recorded samples so you can see when and how a value moved without polling yourself.",
+         {{"memory", "watch_add", R"({"addr":<addr>,"width":"f32","label":"speed"})", "start sampling"},
+          {"memory", "watch_history", R"({"id":<id>,"limit":256})", "timestamped samples, newest last"},
+          {"memory", "scan_results", R"({"offset":0,"limit":1000})", "page a large scan without rescanning"}}},
+        {"dump_process", "Dump a whole process: minidump, every region, or one span",
+         "minidump writes a full-memory .dmp for WinDbg (local Windows). dump_regions writes every committed region plus an index.json on any backend, consoles included. memory.dump streams one span.",
+         {{"target", "minidump", R"({"path":"C:/dumps/game.dmp","full":true})", "local Windows: WinDbg-ready dump"},
+          {"memory", "dump_regions", R"({"dir":"C:/dumps/regions","writable_only":true})", "any backend: one .bin per region + index.json"},
+          {"memory", "dump", R"({"addr":<addr>,"len":<len>,"path":"C:/dumps/span.bin"})", "a single span"}}},
+        {"dump_module_rebuild", "Dump a loaded module as a runnable, analyzable PE",
+         "dump_module copies the mapped image back to a PE: virtual layout keeps unpacked/bss data, rebase sets ImageBase to the runtime base, and rebuild_imports reconstructs the import table from the live IAT so static tools see real API names.",
+         {{"target", "modules", "{}", "pick the module"},
+          {"target", "dump_module", R"({"name":"game.exe","path":"C:/dumps/game_dump.exe","rebuild_imports":true,"load":true})", "dump + IAT rebuild + load into disasm"},
+          {"disasm", "pe", "{}", "check the rebuilt import directory"}}},
+        {"il2cpp_dump", "Dump Unity IL2CPP metadata: classes, fields with offsets, method addresses",
+         "il2cpp_dump parses global-metadata.dat and locates the registration tables in GameAssembly.dll / libil2cpp.so / a PS4 PRX (or the loaded module on the live target) and writes dump.cs, il2cpp.json and il2cpp.h.",
+         {{"target", "modules", "{}", "find GameAssembly.dll (PC) or the il2cpp PRX (PS4)"},
+          {"re", "il2cpp_dump", R"({"metadata":"C:/game/Data/il2cpp_data/Metadata/global-metadata.dat","module":"GameAssembly.dll","out_dir":"C:/dumps/il2cpp"})", "live: read the loaded module from the target"},
+          {"re", "il2cpp_dump", R"({"metadata":"global-metadata.dat","binary":"C:/dumps/Il2CppUserAssemblies.elf","out_dir":"C:/dumps/il2cpp"})", "offline: a binary on disk (PS4: dump the PRX with ps4_dump_module first)"}}},
+        {"ue_dump", "Dump an Unreal Engine 4/5 SDK from the live target",
+         "ue_dump finds GNames/FNamePool and GUObjectArray by structural checks (or takes explicit addresses) and walks every class, struct and enum: property names, types, offsets and sizes, written as Dumpspace JSON and an SDK header.",
+         {{"target", "modules", "{}", "the game module on the live target"},
+          {"re", "ue_dump", R"({"out_dir":"C:/dumps/ue"})", "auto-locate and dump"},
+          {"re", "ue_dump", R"({"gnames":<addr>,"gobjects":<addr>,"version":"5.x","out_dir":"C:/dumps/ue"})", "explicit addresses when auto-locate fails"}}},
         {"ps4_hw_watchpoints", "Hardware watchpoints on the PS4 without modifying code",
          "ps4debug programs the DR0-DR3 registers on the console, so watchpoints catch execution/reads/writes with no INT3 byte in memory - invisible to in-game integrity scans.",
          {{"debugger", "ps4_watch_set", R"({"addr":<addr>,"type":0,"len":8})", "type 0=exec 1=write 3=rdwr, len 1/2/4/8"},
@@ -418,7 +450,10 @@ json topic_json(const guide_topic_t& t) {
         json st;
         st["tool"] = s.tool;
         st["action"] = s.action;
-        st["params"] = json::parse(s.params, nullptr, false);
+        // placeholders like {"addr":<hit>} are not JSON: keep them as the template
+        // string, a discarded value would serialize as invalid JSON
+        json p = json::parse(s.params, nullptr, false);
+        st["params"] = p.is_discarded() ? json(s.params) : std::move(p);
         st["why"] = s.why;
         steps.push_back(std::move(st));
     }

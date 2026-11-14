@@ -340,3 +340,278 @@ TEST_CASE(module_dump_raw_span_zero_fills_gaps) {
     CHECK(out[0x3000] == 0x03);
     CHECK(res.section_count == 2u);
 }
+
+namespace {
+
+// several mapped images at their own bases behind one reader
+slop::core::process::module_read_fn_t multi_reader(
+    const std::vector<std::pair<uintptr_t, const std::vector<uint8_t>*>>& images) {
+    return [images](uintptr_t address, void* output, size_t size) {
+        slop::core::runtime::io_result_t result;
+        for (const auto& [base, img] : images) {
+            if (address >= base && size <= img->size() && address - base <= img->size() - size) {
+                std::memcpy(output, img->data() + (address - base), size);
+                result.ok = true;
+                result.bytes = size;
+                return result;
+            }
+        }
+        result.error = ERROR_PARTIAL_COPY;
+        return result;
+    };
+}
+
+struct fake_export_t {
+    std::string name;        // empty = ordinal only
+    uint32_t rva = 0;        // ignored when forward is set
+    std::string forward;     // "dll.Func"
+};
+
+// a minimal PE32+ image with only an export directory
+std::vector<uint8_t> make_export_dll(const std::vector<fake_export_t>& exports) {
+    std::vector<uint8_t> image(0x2000, 0);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image.data());
+    dos->e_magic = IMAGE_DOS_SIGNATURE;
+    dos->e_lfanew = 0x80;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x80);
+    nt->Signature = IMAGE_NT_SIGNATURE;
+    nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+    nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+    nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    nt->OptionalHeader.SizeOfImage = 0x2000;
+    nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    nt->OptionalHeader.DataDirectory[0] = {0x1000, 0x400};
+
+    auto* ed = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(image.data() + 0x1000);
+    ed->Base = 1;
+    ed->NumberOfFunctions = static_cast<DWORD>(exports.size());
+    ed->AddressOfFunctions = 0x1040;
+    ed->AddressOfNames = 0x1080;
+    ed->AddressOfNameOrdinals = 0x10C0;
+    uint32_t str = 0x1100, named = 0;
+    for (size_t i = 0; i < exports.size(); ++i) {
+        const auto& e = exports[i];
+        uint32_t rva = e.rva;
+        if (!e.forward.empty()) {   // forwarders point inside the export directory
+            rva = str;
+            std::memcpy(image.data() + str, e.forward.c_str(), e.forward.size() + 1);
+            str += static_cast<uint32_t>(e.forward.size() + 1);
+        }
+        std::memcpy(image.data() + 0x1040 + i * 4, &rva, 4);
+        if (e.name.empty()) continue;
+        std::memcpy(image.data() + 0x1080 + named * 4, &str, 4);
+        const auto ord = static_cast<uint16_t>(i);
+        std::memcpy(image.data() + 0x10C0 + named * 2, &ord, 2);
+        std::memcpy(image.data() + str, e.name.c_str(), e.name.size() + 1);
+        str += static_cast<uint32_t>(e.name.size() + 1);
+        ++named;
+    }
+    ed->NumberOfNames = named;
+    return image;
+}
+
+} // namespace
+
+TEST_CASE(module_dump_virtual_layout_keeps_data_past_raw_size) {
+    using namespace slop::core;
+    auto mapped = make_mapped_image();
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(mapped.data() + 0x80);
+    IMAGE_FIRST_SECTION(nt)[1].Misc.VirtualSize = 0x1000;   // .data: bss past the 0x200 raw bytes
+    mapped[0x2800] = 0x5A;
+    process::module_dump_options_t options;
+    options.layout = process::pe_layout_t::virtual_image;
+    std::vector<uint8_t> output;
+    const auto result = process::reconstruct_mapped_pe(
+        kImageBase, static_cast<uint32_t>(mapped.size()), reader_for(mapped), output, options);
+    REQUIRE(result.ok);
+    CHECK(result.layout == "virtual");
+    REQUIRE(output.size() >= 0x3000u);
+    CHECK(output[0x1000] == 0xCC);
+    CHECK(output[0x2000] == 0x7A);
+    CHECK(output[0x2800] == 0x5A);
+    const auto pe = disasm::pe_parse(output.data(), output.size());
+    REQUIRE(pe.ok);
+    REQUIRE_EQ(pe.sections.size(), size_t{2});
+    CHECK(pe.sections[1].raw_offset == 0x2000u);
+    CHECK(pe.sections[1].raw_size == 0x1000u);
+}
+
+TEST_CASE(module_dump_rebase_and_oep_override) {
+    using namespace slop::core;
+    auto mapped = make_mapped_image();
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(mapped.data() + 0x80);
+    nt->OptionalHeader.ImageBase = 0x180000000ull;   // linked base differs from the runtime one
+    nt->OptionalHeader.CheckSum = 0x1234;
+    process::module_dump_options_t options;
+    options.rebase = true;
+    options.oep = kImageBase + 0x1010;
+    std::vector<uint8_t> output;
+    const auto result = process::reconstruct_mapped_pe(
+        kImageBase, static_cast<uint32_t>(mapped.size()), reader_for(mapped), output, options);
+    REQUIRE(result.ok);
+    CHECK(result.oep_rva == 0x1010u);
+    const auto pe = disasm::pe_parse(output.data(), output.size());
+    REQUIRE(pe.ok);
+    CHECK(pe.image_base == kImageBase);
+    CHECK(pe.entry_rva == 0x1010u);
+    const auto* out_nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(output.data() + 0x80);
+    CHECK(out_nt->OptionalHeader.CheckSum == 0u);
+
+    options.oep = 0x9000000;   // neither an RVA nor a VA inside the module
+    CHECK(!process::reconstruct_mapped_pe(
+        kImageBase, static_cast<uint32_t>(mapped.size()), reader_for(mapped), output, options).ok);
+}
+
+TEST_CASE(module_dump_rebuilds_imports_from_iat_scan) {
+    using namespace slop::core;
+    constexpr uintptr_t kDllA = 0x7FF800000000ull, kDllB = 0x7FF810000000ull;
+    const auto dll_a = make_export_dll({{"FuncA", 0x1800, ""},
+                                        {"FuncB", 0x1810, ""},
+                                        {"FwdC", 0, "dllb.Target"}});
+    const auto dll_b = make_export_dll({{"Target", 0x1900, ""}, {"", 0x1910, ""}});
+
+    auto mapped = make_mapped_image();
+    std::fill_n(mapped.begin() + 0x2100, 0x40, uint8_t{0});
+    const uint64_t slots[] = {kDllA + 0x1800, kDllA + 0x1810, kDllB + 0x1900, 0,
+                              kDllB + 0x1910, 0};
+    std::memcpy(mapped.data() + 0x2100, slots, sizeof(slots));
+
+    std::vector<runtime::module_info_t> mods(3);
+    mods[0] = {kImageBase, 0x3000, "main.exe", ""};
+    mods[1] = {kDllA, 0x2000, "dlla.dll", ""};
+    mods[2] = {kDllB, 0x2000, "dllb.dll", ""};
+    process::module_dump_options_t options;
+    options.layout = process::pe_layout_t::virtual_image;
+    options.rebuild_imports = true;
+    options.import_modules = mods;
+    std::vector<uint8_t> output;
+    const auto result = process::reconstruct_mapped_pe(
+        kImageBase, 0x3000,
+        multi_reader({{kImageBase, &mapped}, {kDllA, &dll_a}, {kDllB, &dll_b}}), output, options);
+    REQUIRE(result.ok);
+    CHECK(result.import_modules == 2u);
+    CHECK(result.import_functions == 4u);
+    CHECK(result.import_unresolved == 0u);
+    CHECK(result.section_count == 3u);
+
+    const auto pe = disasm::pe_parse(output.data(), output.size());
+    REQUIRE(pe.ok);
+    REQUIRE_EQ(pe.sections.size(), size_t{3});
+    CHECK(std::string(pe.sections[2].name) == ".slopimp");
+    CHECK(pe.data_dirs[12].rva == 0x2100u);
+    REQUIRE_EQ(pe.imports.size(), size_t{2});
+    CHECK(pe.imports[0].dll == "dlla.dll");
+    REQUIRE_EQ(pe.imports[0].functions.size(), size_t{3});
+    CHECK(pe.imports[0].functions[0].name == "FuncA");
+    CHECK(pe.imports[0].functions[1].name == "FuncB");
+    CHECK(pe.imports[0].functions[2].name == "FwdC");   // forwarder alias kept with its dll
+    CHECK(pe.imports[0].functions[0].iat_rva == 0x2100u);
+    CHECK(pe.imports[1].dll == "dllb.dll");
+    REQUIRE_EQ(pe.imports[1].functions.size(), size_t{1});
+    CHECK(pe.imports[1].functions[0].by_ordinal);
+    CHECK(pe.imports[1].functions[0].ordinal == 2);
+    CHECK(pe.imports[1].functions[0].iat_rva == 0x2120u);
+}
+
+TEST_CASE(module_dump_minidump_of_current_process) {
+    const auto path = std::filesystem::temp_directory_path() / L"slop_selftest.dmp";
+    uint64_t bytes = 0;
+    std::string error;
+    REQUIRE(slop::core::process::write_minidump(GetCurrentProcessId(), path.string(), false,
+                                                bytes, error));
+    CHECK(bytes > 4u);
+    std::ifstream file(path, std::ios::binary);
+    char magic[4] = {};
+    file.read(magic, 4);
+    CHECK(std::memcmp(magic, "MDMP", 4) == 0);
+    file.close();
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+namespace {
+
+constexpr uintptr_t kDllA2 = 0x7FF800000000ull, kDllB2 = 0x7FF810000000ull;
+
+slop::core::process::module_dump_result_t rebuild_with_dlls(
+    const std::vector<uint8_t>& mapped, slop::core::process::pe_layout_t layout,
+    std::vector<uint8_t>& output) {
+    using namespace slop::core;
+    static const auto dll_a = make_export_dll({{"FuncA", 0x1800, ""}, {"FuncB", 0x1810, ""}});
+    static const auto dll_b = make_export_dll({{"Target", 0x1900, ""}, {"Other", 0x1910, ""}});
+    process::module_dump_options_t options;
+    options.layout = layout;
+    options.rebuild_imports = true;
+    options.import_modules = {{kImageBase, 0x3000, "main.exe", ""},
+                              {kDllA2, 0x2000, "dlla.dll", ""},
+                              {kDllB2, 0x2000, "dllb.dll", ""}};
+    return process::reconstruct_mapped_pe(
+        kImageBase, 0x3000,
+        multi_reader({{kImageBase, &mapped}, {kDllA2, &dll_a}, {kDllB2, &dll_b}}), output, options);
+}
+
+} // namespace
+
+TEST_CASE(module_dump_imports_fall_back_to_last_section_without_header_room) {
+    using namespace slop::core;
+    auto mapped = make_mapped_image();
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(mapped.data() + 0x80);
+    nt->OptionalHeader.SizeOfHeaders = 0x1D8;   // section table ends exactly here
+    std::fill_n(mapped.begin() + 0x2100, 0x40, uint8_t{0});
+    const uint64_t slots[] = {kDllA2 + 0x1800, kDllA2 + 0x1810, 0};
+    std::memcpy(mapped.data() + 0x2100, slots, sizeof(slots));
+
+    for (auto layout : {process::pe_layout_t::file, process::pe_layout_t::virtual_image}) {
+        std::vector<uint8_t> output;
+        const auto result = rebuild_with_dlls(mapped, layout, output);
+        REQUIRE(result.ok);
+        CHECK(result.section_count == 2u);
+        CHECK(result.import_functions == 2u);
+        bool warned = false;
+        for (const auto& w : result.warnings)
+            if (w.find("last section") != std::string::npos) warned = true;
+        CHECK(warned);
+        const auto pe = disasm::pe_parse(output.data(), output.size());
+        REQUIRE(pe.ok);
+        REQUIRE_EQ(pe.sections.size(), size_t{2});
+        CHECK(pe.data_dirs[1].rva == 0x2200u);   // right after .data's raw bytes
+        CHECK((pe.sections[1].characteristics & 0x40000040u) == 0x40000040u);
+        REQUIRE_EQ(pe.imports.size(), size_t{1});
+        CHECK(pe.imports[0].dll == "dlla.dll");
+        REQUIRE_EQ(pe.imports[0].functions.size(), size_t{2});
+        CHECK(pe.imports[0].functions[0].name == "FuncA");
+        CHECK(pe.imports[0].functions[1].name == "FuncB");
+    }
+}
+
+TEST_CASE(module_dump_imports_from_intact_import_directory) {
+    using namespace slop::core;
+    auto mapped = make_mapped_image();
+    std::fill_n(mapped.begin() + 0x2100, 0x100, uint8_t{0});
+    // the descriptor's IAT holds resolved dlla addresses
+    const uint64_t iat[] = {kDllA2 + 0x1800, kDllA2 + 0x1810, 0};
+    std::memcpy(mapped.data() + 0x2100, iat, sizeof(iat));
+    // a stray dllb pointer run the scan would pick up but the directory does not name
+    const uint64_t stray[] = {kDllB2 + 0x1900, kDllB2 + 0x1910, 0};
+    std::memcpy(mapped.data() + 0x2140, stray, sizeof(stray));
+    IMAGE_IMPORT_DESCRIPTOR desc{};
+    desc.Name = 0x21C0;
+    desc.FirstThunk = 0x2100;
+    std::memcpy(mapped.data() + 0x2180, &desc, sizeof(desc));
+    std::memcpy(mapped.data() + 0x21C0, "dlla.dll", 9);
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(mapped.data() + 0x80);
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = {0x2180, 40};
+
+    std::vector<uint8_t> output;
+    const auto result = rebuild_with_dlls(mapped, process::pe_layout_t::virtual_image, output);
+    REQUIRE(result.ok);
+    CHECK(result.import_modules == 1u);
+    CHECK(result.import_functions == 2u);
+    const auto pe = disasm::pe_parse(output.data(), output.size());
+    REQUIRE(pe.ok);
+    REQUIRE_EQ(pe.imports.size(), size_t{1});   // only what the directory names
+    CHECK(pe.imports[0].dll == "dlla.dll");
+    REQUIRE_EQ(pe.imports[0].functions.size(), size_t{2});
+    CHECK(pe.imports[0].functions[0].name == "FuncA");
+    CHECK(pe.imports[0].functions[0].iat_rva == 0x2100u);
+}

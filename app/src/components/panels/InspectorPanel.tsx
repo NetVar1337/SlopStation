@@ -5,6 +5,7 @@ import { Search, X } from "lucide-react";
 import IconButton from "@/components/IconButton";
 import { useT } from "@/i18n";
 import { formatLabel } from "@/lib/format";
+import { openBinary } from "@/lib/openBinary";
 import { hex as hexAddr, useDisasm } from "@/store/disasm";
 import { useEngine } from "@/store/engine";
 import { useTargets } from "@/store/targets";
@@ -33,6 +34,7 @@ export default function InspectorPanel() {
   const modules = useTargets((s) => s.modules);
   const ps4 = useTargets((s) => s.ps4);
   const setInspectorOpen = useUi((s) => s.setInspectorOpen);
+  const setRail = useUi((s) => s.setRail);
   // Image facts come from the disasm store, not from `hype.image`: the
   // workspace reads `disasm.loaded` and the event mirror can lag it, which had
   // the Inspector naming one image while the listing showed another
@@ -56,6 +58,14 @@ export default function InspectorPanel() {
             </div>
             <div className="empty-title">{t("inspector.empty")}</div>
             <div className="empty-hint">{t("inspector.emptyHint")}</div>
+            <div className="payload-actions" style={{ justifyContent: "center" }}>
+              <button type="button" className="row-action" onClick={() => setRail("targets")}>
+                {t("titlebar.attachToProcess")}
+              </button>
+              <button type="button" className="row-action" onClick={() => void openBinary()}>
+                {t("common.openBinary")}
+              </button>
+            </div>
           </div>
         ) : (
           <div className="inspector">

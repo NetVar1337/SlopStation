@@ -21,6 +21,7 @@
 - [Live debugging](features/live-debugging.md)
 - [On-console tooling](features/on-console-tooling.md)
 - [Static analysis](features/static-analysis.md)
+- [Engine dumpers (IL2CPP, Unreal)](features/engine-dumpers.md)
 - [Decompiler](features/decompiler.md)
 - [Emulation and devirtualization](features/emulation-devirt.md)
 - [Host network and proxy](features/network-proxy.md)

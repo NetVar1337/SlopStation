@@ -127,9 +127,12 @@ describe("shortcuts (item 91)", () => {
     useUi.getState().closeSettings();
     expect(handleShortcut(key("3"))).toBe(true);
     expect(useUi.getState().workspaceTab).toBe("memory");
+    // the starting state follows the viewport width (auto-collapse), so toggle relative to it
+    const before = useUi.getState().inspectorOpen;
     expect(handleShortcut(key("i", { altKey: true }))).toBe(true);
-    expect(useUi.getState().inspectorOpen).toBe(false);
-    useUi.getState().setInspectorOpen(true);
+    expect(useUi.getState().inspectorOpen).toBe(!before);
+    expect(useUi.getState().inspectorPinned).toBe(true);
+    useUi.getState().resetLayout();
   });
 
   it("ignores plain keys", () => {

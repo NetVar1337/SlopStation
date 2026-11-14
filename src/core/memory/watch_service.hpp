@@ -78,6 +78,17 @@ size_t size();
 std::string export_ct();
 size_t import_ct(std::string_view xml, std::string* err = nullptr);
 
+// Value history per entry: a ring of the last kHistoryCap samples, recorded on
+// each service pass when the value changed, and at least once per second
+// otherwise. ms is wall-clock epoch ms. Dropped with the entry.
+struct sample_t {
+    int64_t  ms   = 0;
+    uint64_t bits = 0;
+};
+inline constexpr size_t kHistoryCap = 512;
+// newest `limit` samples, oldest first; false when the id is unknown
+bool history(uint64_t id, size_t limit, std::vector<sample_t>& out);
+
 // one service pass, sample values, apply freezes, publish when anything
 // moved, rate limited to about 10hz
 void tick();
@@ -123,6 +134,11 @@ std::vector<value_t> sample_pass(const std::vector<entry_t>& entries,
                                  pass_io_t& io, const pass_limits_t& lim,
                                  size_t& cursor, pass_stats_t* stats = nullptr,
                                  int64_t now_ms = 0);
+
+// History rule applied by tick() to each sampled value (exposed for tests):
+// appends when bits differ from the newest sample or 1 s passed since it.
+// No-op for an unknown id. Returns true when a sample was appended
+bool record_sample(uint64_t id, int64_t ms, uint64_t bits);
 
 } // namespace detail
 

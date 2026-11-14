@@ -698,6 +698,54 @@ function Ps5Card() {
   );
 }
 
+/**
+ * One console connect area for both platforms: a PS4/PS5 switch, the active
+ * platform's form, then the saved consoles. Lives in the panel flow (never
+ * stacked over the list) so a short panel scrolls instead of clipping.
+ */
+function ConnectArea({
+  compact,
+  host,
+  port,
+  onHost,
+  onPort,
+}: {
+  compact: boolean;
+  host: string;
+  port: number;
+  onHost: (v: string) => void;
+  onPort: (v: number) => void;
+}) {
+  const t = useT();
+  const [kind, setKind] = useState<"ps4" | "ps5">("ps4");
+  return (
+    <section className="connect-area" data-compact={compact} aria-label={t("targets.connectArea")}>
+      <div className="seg" role="group" aria-label={t("targets.platform")}>
+        {(["ps4", "ps5"] as const).map((k) => (
+          <button
+            key={k}
+            type="button"
+            className="seg-button"
+            aria-pressed={kind === k}
+            onClick={() => setKind(k)}
+          >
+            {k.toUpperCase()}
+          </button>
+        ))}
+      </div>
+      {kind === "ps4" ? (
+        <>
+          <ConnectForm compact={compact} host={host} port={port} onHost={onHost} onPort={onPort} />
+          {!compact && <PayloadCard host={host} />}
+        </>
+      ) : (
+        <Ps5Card />
+      )}
+      <ConsolesCard />
+    </section>
+  );
+}
+
 export default function TargetsPanel() {
   const t = useT();
   const {
@@ -745,7 +793,10 @@ export default function TargetsPanel() {
 
   const banner = backend.ps4 ? (
     <div className="connect-bar" role="status">
-      <span className="faint connect-text">
+      <span
+        className="faint connect-text"
+        data-tip={`${ps4?.endpoint ?? ""} ${ps4?.branding ?? ""}`}
+      >
         PS4 {ps4?.endpoint ?? ""}
         {ps4?.branding ? ` · ${ps4.branding}` : ""}
       </span>
@@ -754,8 +805,6 @@ export default function TargetsPanel() {
         {t("targets.detach")}
       </button>
     </div>
-  ) : showConnect && showHost ? (
-    <ConnectForm compact host={host} port={port} onHost={setHost} onPort={setPort} />
   ) : null;
 
   return (
@@ -782,7 +831,7 @@ export default function TargetsPanel() {
             <Unplug size={14} />
           </IconButton>
         )}
-        {!backend.ps4 && showHost && (
+        {listing && (
           <IconButton
             tip={t("targets.connectTip")}
             pressed={showConnect}
@@ -798,31 +847,41 @@ export default function TargetsPanel() {
         )}
       </div>
 
-      {/* Always present so the grid rows stay head / banner (auto) / list (1fr):
+      {/* Always present so the grid rows stay head / banner (auto) / body (1fr):
           a bare banner child used to land in the 1fr track and stretch */}
       <div className="banner-slot">
         {banner}
-        <ConsolesCard />
-        <Ps5Card />
+        {listing && showConnect && (
+          <div className="connect-drawer">
+            <ConnectArea compact host={host} port={port} onHost={setHost} onPort={setPort} />
+          </div>
+        )}
       </div>
 
       {!listing ? (
-        <div className="empty connect-empty">
-          <div className="empty-glyph">
-            <Gamepad2 size={28} strokeWidth={1.5} />
-          </div>
-          <div className="empty-title">{t("targets.connectConsole")}</div>
-          <div className="empty-hint">{t("targets.connectHint")}</div>
-          <ConnectForm compact={false} host={host} port={port} onHost={setHost} onPort={setPort} />
-          <PayloadCard host={host} />
-          {error !== null && (
-            <div className="empty-hint error-text" role="alert">
-              {error}
+        <div className="panel-body">
+          <div className="empty connect-empty">
+            <div className="empty-glyph">
+              <Gamepad2 size={28} strokeWidth={1.5} />
             </div>
-          )}
-          <button type="button" className="link-button" onClick={() => setShowHost(true)}>
-            {t("targets.listHost")}
-          </button>
+            <div className="empty-title">{t("targets.connectConsole")}</div>
+            <div className="empty-hint">{t("targets.connectHint")}</div>
+            <ConnectArea
+              compact={false}
+              host={host}
+              port={port}
+              onHost={setHost}
+              onPort={setPort}
+            />
+            {error !== null && (
+              <div className="empty-hint error-text" role="alert">
+                {error}
+              </div>
+            )}
+            <button type="button" className="link-button" onClick={() => setShowHost(true)}>
+              {t("targets.listHost")}
+            </button>
+          </div>
         </div>
       ) : (
         <div className="targets-list">
@@ -840,18 +899,32 @@ export default function TargetsPanel() {
               </button>
             )}
           </div>
-          {error !== null && (
-            <div
-              className="empty-hint error-text"
-              role="alert"
-              style={{ padding: "var(--pad-sm) var(--pad-md)" }}
-            >
-              {error}
-            </div>
-          )}
+          {/* Always present: the list must stay in the 1fr row even when there
+              is no error or empty-result note */}
+          <div className="targets-notes">
+            {error !== null && (
+              <div className="empty-hint error-text" role="alert">
+                {error}
+              </div>
+            )}
+            {error === null && !loading && rows.length === 0 && (
+              <div className="empty-hint">
+                {filter !== "" ? t("targets.noMatch") : t("targets.noProcesses")}{" "}
+                {filter !== "" ? (
+                  <button type="button" className="link-button" onClick={() => setFilter("")}>
+                    {t("targets.clearFilter")}
+                  </button>
+                ) : (
+                  <button type="button" className="link-button" onClick={() => void refresh()}>
+                    {t("targets.refresh")}
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
 
           <div className="panel-body" ref={scrollRef}>
-            <table className="table">
+            <table className="table vtable">
               <caption className="sr-only">
                 {backend.ps4 ? t("targets.captionPs4") : t("targets.captionHost")}
               </caption>
@@ -864,7 +937,7 @@ export default function TargetsPanel() {
                   <th scope="col" style={{ width: 44 }}>
                     {t("targets.colArch")}
                   </th>
-                  <th scope="col" style={{ width: 60 }}>
+                  <th scope="col" style={{ width: 76 }}>
                     {t("targets.colAction")}
                   </th>
                 </tr>
@@ -918,7 +991,7 @@ export default function TargetsPanel() {
                           <span className="pill">{p.arch}</span>
                         )}
                       </td>
-                      <td style={{ width: 60 }}>
+                      <td style={{ width: 76 }}>
                         {isTarget ? (
                           <button
                             type="button"

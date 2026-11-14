@@ -17,6 +17,7 @@ if(NOT WIN32)
         test_ps4_debug.cpp
         test_ps5.cpp
         test_disasm_accuracy.cpp
+        test_engine_dumpers.cpp
     )
     target_include_directories(slop_tests PRIVATE
         "${CMAKE_SOURCE_DIR}/src/tests"
@@ -44,6 +45,7 @@ add_executable(slop_tests
     test_network.cpp
     test_persist.cpp
     test_re.cpp
+    test_engine_dumpers.cpp
     test_script.cpp
     test_module_dump.cpp
     test_process_tables.cpp

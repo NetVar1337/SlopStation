@@ -2,13 +2,16 @@
 // one global tooltip instead of the native title attribute, any element can
 // opt in with data-tip
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 type Placed = {
   text: string;
   left: number;
   top: number;
   below: boolean;
+  /** Host edges, so the measured bubble can flip to the side that fits. */
+  hostTop: number;
+  hostBottom: number;
 };
 
 /** Long enough not to flicker while the cursor crosses a toolbar. */
@@ -39,14 +42,15 @@ export default function TooltipLayer() {
       if (timer.current !== null) clearTimeout(timer.current);
       timer.current = setTimeout(() => {
         const r = host.getBoundingClientRect();
-        // Prefer below; flip above when the element sits near the bottom edge
-        // (the status bar and Output pane are full of tooltip targets)
-        const below = r.bottom + 34 < window.innerHeight;
+        // Prefer below; the layout effect flips above once the bubble's real
+        // height shows it would run off the bottom edge
         setTip({
           text,
           left: r.left + r.width / 2,
-          top: below ? r.bottom + kGap : r.top - kGap,
-          below,
+          top: r.bottom + kGap,
+          below: true,
+          hostTop: r.top,
+          hostBottom: r.bottom,
         });
       }, delay);
     };
@@ -90,16 +94,27 @@ export default function TooltipLayer() {
     };
   }, []);
 
-  // Clamp horizontally once the bubble has a measured width
-  useEffect(() => {
+  // Clamp horizontally and pick the vertical side once the bubble is measured
+  useLayoutEffect(() => {
     const el = bubbleRef.current;
     if (el === null || tip === null) return;
     const half = el.offsetWidth / 2;
+    const h = el.offsetHeight;
     const clamped = Math.min(
       Math.max(tip.left, half + kMargin),
       window.innerWidth - half - kMargin,
     );
-    if (Math.abs(clamped - tip.left) > 0.5) setTip({ ...tip, left: clamped });
+    const fitsBelow = tip.hostBottom + kGap + h <= window.innerHeight - kMargin;
+    const fitsAbove = tip.hostTop - kGap - h >= kMargin;
+    // Flip only toward a side that fits, so a tip too tall for both settles
+    const below = tip.below ? fitsBelow || !fitsAbove : !(fitsAbove || !fitsBelow);
+    if (Math.abs(clamped - tip.left) > 0.5 || below !== tip.below)
+      setTip({
+        ...tip,
+        left: clamped,
+        below,
+        top: below ? tip.hostBottom + kGap : tip.hostTop - kGap,
+      });
   }, [tip]);
 
   if (tip === null) return null;

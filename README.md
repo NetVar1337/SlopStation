@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="https://github.com/NetVar1337/SlopStation/actions/workflows/build.yml"><img alt="build" src="https://github.com/NetVar1337/SlopStation/actions/workflows/build.yml/badge.svg"></a>
-  <img alt="version" src="https://img.shields.io/badge/version-0.3.1-informational">
+  <img alt="version" src="https://img.shields.io/badge/version-0.4.0-informational">
   <img alt="platform" src="https://img.shields.io/badge/host-Windows%2010%2F11%20x64-blue">
   <img alt="target" src="https://img.shields.io/badge/target-PS4%20%2B%20ps4debug--NG-black">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
@@ -342,8 +342,9 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8765/mcp -ContentType 'appl
   bytes); every `/mcp` and `/api/v1` call needs `Authorization: Bearer <token>`, loopback
   included. Regenerate it from Settings (`app.rotate_token`) — client configs and
   `engine.json` are updated in place. `SLOP_MCP_TOKEN` adds a per-process token without
-  persisting anything. `--insecure-dev` accepts tokenless loopback requests for
-  `npm run dev`; it is the only way to turn the check off.
+  persisting anything. There is no tokenless mode: for `npm run dev` start the engine
+  with `SLOP_MCP_TOKEN=<tok>` and put the same value in `VITE_SLOP_TOKEN` (see
+  `app/README.md`, "Browser dev mode").
 - `--port <n>` overrides the port (it beats `SLOP_MCP_PORT` and the settings port). If the
   port is busy the engine takes an ephemeral port and skips onboarding, and a stale
   `engine.json` registration is probed and dropped instead of announced.

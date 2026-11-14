@@ -208,12 +208,16 @@ const char* width_name(memory::value_width_t w) noexcept {
     return "unknown";
 }
 
-json hits_json(const std::vector<memory::scan_result_t>& hits, size_t limit) {
+// one page of scan rows; address/address_hex sit next to the older addr key
+json hits_json(const std::vector<memory::scan_result_t>& hits, size_t offset, size_t limit) {
     json arr = json::array();
-    const size_t n = std::min(hits.size(), limit);
-    for (size_t i = 0; i < n; ++i) {
+    const size_t end = offset >= hits.size() ? offset : std::min(hits.size(), offset + limit);
+    for (size_t i = offset; i < end; ++i) {
+        const uint64_t a = static_cast<uint64_t>(hits[i].address);
         arr.push_back({
-            {"addr", static_cast<uint64_t>(hits[i].address)},
+            {"addr", a},
+            {"address", a},
+            {"address_hex", addr_hex_str(a)},
             {"bits", hits[i].bits},
             {"value", hits[i].bits},
             {"formatted", memory::format_value_text(hits[i].matched, hits[i].bits)},
@@ -221,6 +225,73 @@ json hits_json(const std::vector<memory::scan_result_t>& hits, size_t limit) {
         });
     }
     return arr;
+}
+
+// total/offset/next_offset of a page (next_offset null at the end)
+void page_fields(json& out, size_t total, size_t offset, size_t returned) {
+    out["total"] = total;
+    out["offset"] = offset;
+    out["next_offset"] = offset + returned < total ? json(offset + returned) : json(nullptr);
+}
+
+// one readable span streamed to out: a failed chunk is retried page by page
+// and unreadable pages are zero-filled (counted) unless strict
+struct span_dump_t {
+    uint64_t    written = 0;
+    uint64_t    unreadable = 0;
+    std::string error;   // set on a strict hole or a file write failure
+};
+
+span_dump_t stream_span(runtime::session_t& s, uint64_t addr, uint64_t len, std::ofstream& out,
+                        bool strict, size_t chunk) {
+    constexpr size_t kPage = 0x1000;
+    span_dump_t r;
+    std::vector<uint8_t> buf(chunk);
+    for (uint64_t off = 0; off < len;) {
+        const size_t n = static_cast<size_t>(std::min<uint64_t>(chunk, len - off));
+        const uint64_t at = addr + off;
+        auto io = s.read(static_cast<uintptr_t>(at), buf.data(), n);
+        if (!io.ok || io.bytes != n) {
+            // page granular retry, page boundaries follow the target address
+            size_t p = 0;
+            while (p < n) {
+                const size_t step = std::min<size_t>(n - p, kPage - ((at + p) & (kPage - 1)));
+                auto pio = s.read(static_cast<uintptr_t>(at + p), buf.data() + p, step);
+                if (!pio.ok || pio.bytes != step) {
+                    if (strict) {
+                        r.error = "unreadable memory at " + addr_hex_str(at + p) + ": " +
+                                  runtime::ps4::io_error_str(pio.error);
+                        return r;
+                    }
+                    std::memset(buf.data() + p, 0, step);
+                    r.unreadable += step;
+                }
+                p += step;
+            }
+        }
+        out.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(n));
+        if (!out) {
+            r.error = "file write failed";
+            return r;
+        }
+        r.written += n;
+        off += n;
+    }
+    return r;
+}
+
+// tmp file then a replacing rename, so a failed dump never leaves a torn file
+bool commit_file(const std::filesystem::path& tmp, const std::filesystem::path& dst) {
+    std::error_code ec;
+#ifdef _WIN32
+    if (::MoveFileExW(tmp.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        return true;
+#else
+    std::filesystem::rename(tmp, dst, ec);
+    if (!ec) return true;
+#endif
+    std::filesystem::remove(tmp, ec);
+    return false;
 }
 
 } // namespace
@@ -234,22 +305,23 @@ json tool_memory(const json& args) {
     {
         static const char* kKnown[] = {
             "read", "write", "scan", "rescan", "scan_state", "scan_reset",
-            "scan_save", "scan_load", "scan_export",
+            "scan_save", "scan_load", "scan_export", "scan_results",
             "aob", "pointerscan", "pointerscan_verify", "snapshot", "snapshots", "diff",
             "snapshot_free", "protect", "alloc", "free", "siggen",
             "live_crypto", "watch_list", "watch_add", "watch_remove",
             "watch_clear", "watch_set", "watch_undo", "watch_freeze_once",
-            "watch_export_ct", "watch_import_ct",
-            "offsets_verify", "dissect",
+            "watch_export_ct", "watch_import_ct", "watch_history",
+            "offsets_verify", "dissect", "dump", "dump_regions",
         };
         const bool known = std::any_of(std::begin(kKnown), std::end(kKnown),
                                         [&](const char* k) { return action == k; });
         if (!known)
             fail("memory: unknown action (read|write|scan|rescan|scan_state|scan_reset|"
-                 "scan_save|scan_load|scan_export|aob|pointerscan|pointerscan_verify|snapshot|snapshots|"
-                 "diff|snapshot_free|protect|alloc|free|siggen|live_crypto|watch_list|"
-                 "watch_add|watch_remove|watch_clear|watch_set|watch_undo|watch_freeze_once|"
-                 "watch_export_ct|watch_import_ct|offsets_verify|dissect)");
+                 "scan_save|scan_load|scan_export|scan_results|aob|pointerscan|pointerscan_verify|"
+                 "snapshot|snapshots|diff|snapshot_free|protect|alloc|free|siggen|live_crypto|"
+                 "watch_list|watch_add|watch_remove|watch_clear|watch_set|watch_undo|"
+                 "watch_freeze_once|watch_export_ct|watch_import_ct|watch_history|offsets_verify|"
+                 "dissect|dump|dump_regions)");
     }
 
     // watchlist
@@ -419,6 +491,26 @@ json tool_memory(const json& args) {
             return out;
         }
 
+        if (action == "watch_history") {
+            if (!args.contains("id")) fail("memory.watch_history: missing id");
+            const uint64_t id = parse_addr(args, "id");
+            const size_t limit = static_cast<size_t>(std::min<uint64_t>(
+                opt_u64(args, "limit", 256), memory::watch::kHistoryCap));
+            const auto entries = memory::watch::list();
+            const auto it = std::find_if(entries.begin(), entries.end(),
+                                         [id](const memory::watch::entry_t& e) { return e.id == id; });
+            std::vector<memory::watch::sample_t> samples;
+            if (it == entries.end() || !memory::watch::history(id, limit, samples))
+                fail("memory.watch_history: no such id");
+            json arr = json::array();
+            for (const auto& smp : samples)
+                arr.push_back({{"ms", smp.ms},
+                               {"value", memory::value_to_double(it->width, smp.bits)},
+                               {"bits", smp.bits},
+                               {"text", memory::format_value_text(it->width, smp.bits)}});
+            return {{"id", id}, {"width", width_name(it->width)}, {"samples", std::move(arr)}};
+        }
+
         fail("memory: unknown watch action");
     }
 
@@ -445,6 +537,20 @@ json tool_memory(const json& args) {
                 {"slots_tracked", stats.slots_tracked},
                 {"truncated", stats.truncated},
                 {"cancelled", stats.cancelled}};
+    }
+
+    // pages the current scan without rescanning
+    if (action == "scan_results") {
+        const auto& rows = g_scan.engine.results();
+        const size_t offset = static_cast<size_t>(std::min<uint64_t>(
+            opt_u64(args, "offset", 0), rows.size()));
+        const size_t limit = static_cast<size_t>(std::min<uint64_t>(opt_u64(args, "limit", 1000), 10000));
+        json page = hits_json(rows, offset, limit);
+        json out = {{"pid", g_scan.pid}, {"width", g_scan.width}, {"kind", g_scan.kind},
+                    {"region_scan_active", g_scan.engine.region_scan_active()}};
+        page_fields(out, rows.size(), offset, page.size());
+        out["results"] = std::move(page);
+        return out;
     }
 
     if (action == "scan_export") {
@@ -721,6 +827,124 @@ json tool_memory(const json& args) {
                 {"note", "rescan continues from these rows"}};
     }
 
+    // raw bytes of any span (local, PS4, PS5) streamed to a file; a console
+    // gets big chunks since every read is a socket roundtrip
+    if (action == "dump" || action == "dump_regions") {
+        namespace fs = std::filesystem;
+        constexpr uint64_t kDumpCap = 4ull << 30;   // 4 GiB
+        const size_t chunk = s.backend()->kind() == runtime::backend_kind_t::user_mode
+                                 ? (1u << 20) : (8u << 20);
+        std::error_code ec;
+
+        if (action == "dump") {
+            const uint64_t addr = parse_addr(args, "addr");
+            const uint64_t len = parse_addr_alias(args, {"len", "size"});
+            if (len == 0) fail("memory.dump: len must be greater than 0");
+            if (len > kDumpCap) fail("memory.dump: len capped at 4 GiB");
+            if (addr + len < addr) fail("memory.dump: range wraps the address space");
+            const std::string path = opt_str(args, "path", "");
+            if (path.empty()) fail("memory.dump requires 'path'");
+            const bool strict = opt_bool(args, "strict", false);
+            const fs::path dst(path);
+            if (dst.has_parent_path()) fs::create_directories(dst.parent_path(), ec);
+            fs::path tmp = dst;
+            tmp += ".part";
+            span_dump_t r;
+            {
+                std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+                if (!f) fail("memory.dump: cannot create " + tmp.string());
+                r = stream_span(s, addr, len, f, strict, chunk);
+                f.close();
+                if (r.error.empty() && !f) r.error = "file write failed";
+            }
+            if (r.error.empty() && r.unreadable == len)
+                r.error = "nothing readable in " + addr_hex_str(addr) + " +" + addr_hex_str(len) +
+                          " (check target.regions)";
+            if (!r.error.empty()) {
+                fs::remove(tmp, ec);
+                fail("memory.dump: " + r.error);
+            }
+            if (!commit_file(tmp, dst)) fail("memory.dump: cannot replace " + path);
+            return {{"path", path}, {"addr", addr}, {"addr_hex", addr_hex_str(addr)},
+                    {"len", len}, {"bytes_written", r.written},
+                    {"unreadable_bytes", r.unreadable}, {"complete", r.unreadable == 0}};
+        }
+
+        // dump_regions: every committed readable region plus index.json
+        const std::string dir_s = opt_str(args, "dir", "");
+        if (dir_s.empty()) fail("memory.dump_regions requires 'dir'");
+        const bool writable_only = opt_bool(args, "writable_only", false);
+        const bool exec_only = opt_bool(args, "exec_only", false);
+        const uint64_t max_total = std::min<uint64_t>(opt_u64(args, "max_total", kDumpCap),
+                                                      64ull << 30);
+        const fs::path dir(dir_s);
+        fs::create_directories(dir, ec);
+        if (!fs::is_directory(dir, ec)) fail("memory.dump_regions: cannot create " + dir_s);
+
+        auto regions = runtime::target_scan_regions(s.handle());
+        std::sort(regions.begin(), regions.end(),
+                  [](const auto& a, const auto& b) { return a.base < b.base; });
+        auto mods = s.backend()->enum_modules(s.handle());
+        constexpr uint32_t kWrite = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE |
+                                    PAGE_EXECUTE_WRITECOPY;
+        constexpr uint32_t kExec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                   PAGE_EXECUTE_WRITECOPY;
+        json index = json::array();
+        uint64_t total = 0, unreadable = 0;
+        size_t over_budget = 0, vanished = 0;
+        for (const auto& r : regions) {
+            if (r.protect == 0 || (r.protect & PAGE_NOACCESS)) continue;
+            if (writable_only && !(r.protect & kWrite)) continue;
+            if (exec_only && !(r.protect & kExec)) continue;
+            // skip what does not fit, smaller regions after it still might
+            if (total + r.size > max_total) { ++over_budget; continue; }
+            char name[64];
+            std::snprintf(name, sizeof(name), "%llX-%llX.bin",
+                          static_cast<unsigned long long>(r.base),
+                          static_cast<unsigned long long>(r.size));
+            const fs::path file = dir / name;
+            fs::path tmp = file;
+            tmp += ".part";
+            span_dump_t sd;
+            {
+                std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+                if (!f) fail("memory.dump_regions: cannot create " + tmp.string());
+                sd = stream_span(s, r.base, r.size, f, false, chunk);
+                f.close();
+                if (sd.error.empty() && !f) sd.error = "file write failed";
+            }
+            if (!sd.error.empty()) {
+                fs::remove(tmp, ec);
+                fail("memory.dump_regions: " + sd.error + " (" + file.string() + ")");
+            }
+            if (sd.unreadable == r.size) {   // freed or protected since the walk
+                fs::remove(tmp, ec);
+                ++vanished;
+                continue;
+            }
+            if (!commit_file(tmp, file)) fail("memory.dump_regions: cannot replace " + file.string());
+            total += sd.written;
+            unreadable += sd.unreadable;
+            json module = nullptr;
+            if (mods.ok)
+                for (const auto& m : mods.items)
+                    if (r.base >= m.base && r.base < m.base + m.size) { module = m.name; break; }
+            index.push_back({{"base", static_cast<uint64_t>(r.base)},
+                             {"base_hex", addr_hex_str(r.base)},
+                             {"size", static_cast<uint64_t>(r.size)},
+                             {"protect", r.protect}, {"type", r.type},
+                             {"module", module}, {"file", std::string(name)},
+                             {"unreadable_bytes", sd.unreadable}});
+        }
+        const fs::path index_path = dir / "index.json";
+        if (!infra::paths::write_file_atomic(index_path.string(), index.dump(2)))
+            fail("memory.dump_regions: cannot write " + index_path.string());
+        return {{"dir", dir_s}, {"regions", index.size()}, {"bytes_written", total},
+                {"unreadable_bytes", unreadable}, {"index_path", index_path.string()},
+                {"skipped_over_budget", over_budget}, {"skipped_unreadable", vanished},
+                {"truncated", over_budget > 0}};
+    }
+
     if (action == "write") {
         const uint64_t addr = parse_addr(args, "addr");
         if (!args.contains("hex") || !args.at("hex").is_string()) fail("missing hex payload");
@@ -876,9 +1100,11 @@ json tool_memory(const json& args) {
         const auto& out = g_scan.engine.results();
         const auto stats = g_scan.engine.stats();
         const size_t limit = static_cast<size_t>(std::min<uint64_t>(opt_u64(args, "limit", 100), 10000));
-        return {
-            {"hits", hits_json(out, limit)},
-            {"total", out.size()},
+        const size_t offset = static_cast<size_t>(std::min<uint64_t>(opt_u64(args, "offset", 0), out.size()));
+        json hits = hits_json(out, offset, limit);
+        const size_t returned = hits.size();
+        json res = {
+            {"hits", std::move(hits)},
             {"truncated", stats.truncated},
             {"cancelled", stats.cancelled},
             {"bytes_scanned", stats.bytes_scanned},
@@ -889,6 +1115,8 @@ json tool_memory(const json& args) {
             {"width", width_label},
             {"io", io_hints_json(reader.hints())}
         };
+        page_fields(res, out.size(), offset, returned);
+        return res;
     }
 
     if (action == "aob") {

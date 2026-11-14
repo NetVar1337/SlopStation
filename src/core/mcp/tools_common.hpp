@@ -220,6 +220,9 @@ json tool_gdb(const json& args);
 // conditional breakpoints live in tools_debugger.cpp; a console disconnect
 // must drop them so stale addresses never re-arm in a new session
 void clear_breakpoint_conditions();
+// target.detach releases the local Win32 debugger too (tracers, watchpoints,
+// breakpoints), otherwise the process stays held and cannot exit while we live
+void release_local_debugger();
 
 // live progress for a running call (notifications/progress). value must be
 // monotonic; total is set only when the operation knows its size

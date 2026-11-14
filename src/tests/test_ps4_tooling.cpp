@@ -368,6 +368,203 @@ TEST_CASE_TIMEOUT(ps4_composites_on_local_debugger, 180) {
     CHECK(t.alive());
 }
 
+TEST_CASE_TIMEOUT(debugger_access_tracer_on_local_process, 180) {
+    // "find out what writes": the tracer resumes after every DR hit and
+    // aggregates the writing instruction (func's mov [data], rcx)
+    slop::core::process::target_disconnect_ps4();
+    loop_target_t t;
+    REQUIRE(t.ok);
+    const uint64_t func = t.base + 0x40, data = t.base + 0x108;
+    REQUIRE(slop::core::process::target_attach(t.pi.dwProcessId));
+    bool e = false;
+    auto dbg = [&](const json& a) { return slop::core::mcp::call_tool("debugger", a, e); };
+    const auto wait_until = [&](uint64_t id, auto done) {
+        json st;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        while (std::chrono::steady_clock::now() < deadline) {
+            st = dbg({{"action", "access_status"}, {"id", id}});
+            if (e || done(st)) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return st;
+    };
+
+    json r = dbg({{"action", "access_start"}, {"addr", data}, {"len", 8}, {"kind", "write"},
+                  {"max_hits", 1000000}});
+    CHECK(!e);
+    if (e) std::printf("  access_start err: %s\n", r.dump().c_str());
+    const uint64_t id = r.value("id", uint64_t{0});
+    REQUIRE(id != 0);
+    CHECK(r.value("debugger", std::string{}) == "user");
+    // one tracer owns the event stream at a time
+    json r2 = dbg({{"action", "access_start"}, {"addr", data + 8}, {"len", 8}});
+    CHECK(e);
+    CHECK(r2.value("error", std::string{}).find("already running") != std::string::npos);
+
+    r = wait_until(id, [](const json& st) { return st.value("hits", 0) >= 3; });
+    CHECK(!e);
+    CHECK(r.value("running", false) == true);
+    r = dbg({{"action", "access_stop"}, {"id", id}});
+    CHECK(!e);
+    if (e) std::printf("  access_stop err: %s\n", r.dump().c_str());
+    CHECK(r.value("running", true) == false);
+    CHECK(r.value("stop_reason", std::string{}) == "stopped");
+    CHECK(r.value("hits", 0) >= 3);
+    // misaligned addresses and unknown kinds are refused up front
+    dbg({{"action", "access_start"}, {"addr", data + 1}, {"len", 8}});
+    CHECK(e);
+    dbg({{"action", "access_start"}, {"addr", data}, {"len", 8}, {"kind", "read"}});
+    CHECK(e);
+    REQUIRE(r.contains("sites") && r["sites"].is_array() && !r["sites"].empty());
+    const json top = r["sites"][0];
+    CHECK(top.value("rip", 0ull) == func + 0x7);   // the DR trap lands after the store
+    CHECK(top.value("count", 0ull) > 0ull);
+    CHECK(top.value("insn_rip", 0ull) == func);    // decoded back to the writer
+    CHECK(top["disasm"].is_string());
+    CHECK(top["regs"].value("rcx", 0ull) != 0ull);
+    CHECK(top.contains("first_ms") && top.contains("last_ms"));
+    // the watchpoint is gone
+    r = dbg({{"action", "ps4_watch_list"}});
+    CHECK(!e);
+    CHECK(r.value("count", 99) == 0);
+    r = dbg({{"action", "access_list"}});
+    CHECK(!e);
+    REQUIRE(r["sessions"].is_array() && !r["sessions"].empty());
+    CHECK(r["sessions"].back().value("running", true) == false);
+
+    // duration bound: ends on its own and disarms
+    r = dbg({{"action", "access_start"}, {"addr", data}, {"len", 8}, {"duration_ms", 300}});
+    CHECK(!e);
+    const uint64_t id2 = r.value("id", uint64_t{0});
+    REQUIRE(id2 != 0);
+    r = wait_until(id2, [](const json& st) { return !st.value("running", true); });
+    CHECK(!e);
+    CHECK(r.value("running", true) == false);
+    CHECK(r.value("stop_reason", std::string{}) == "duration");
+    r = dbg({{"action", "ps4_watch_list"}});
+    CHECK(r.value("count", 99) == 0);
+
+    // ps4_watch_* on a local debug session; a user slot blocks the tracer
+    r = dbg({{"action", "ps4_watch_set"}, {"addr", data}, {"len", 8}, {"type", 1}});
+    CHECK(!e);
+    if (e) std::printf("  local ps4_watch_set err: %s\n", r.dump().c_str());
+    CHECK(r.value("debugger", std::string{}) == "user");
+    r = dbg({{"action", "ps4_watch_list"}});
+    CHECK(!e);
+    CHECK(r.value("count", 0) == 1);
+    r = dbg({{"action", "access_start"}, {"addr", data}, {"len", 8}});
+    CHECK(e);
+    r = dbg({{"action", "ps4_watch_clear"}, {"addr", data}});
+    CHECK(!e);
+    r = dbg({{"action", "ps4_watch_list"}});
+    CHECK(r.value("count", 99) == 0);
+    dbg({{"action", "ps4_continue"}});   // release a stop the user slot may hold
+
+    r = dbg({{"action", "ps4_detach"}});
+    CHECK(!e);
+    slop::core::process::target_detach();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(t.alive());
+}
+
+TEST_CASE_TIMEOUT(target_detach_releases_local_debugger, 120) {
+    // a watchpoint attaches the Win32 debugger; target.detach (not ps4_detach)
+    // must release it, or the process can never exit while the engine lives
+    slop::core::process::target_disconnect_ps4();
+    loop_target_t t;
+    REQUIRE(t.ok);
+    bool e = false;
+    json r = slop::core::mcp::call_tool("target", {{"action", "attach"}, {"pid", t.pi.dwProcessId}}, e);
+    REQUIRE(!e);
+    r = slop::core::mcp::call_tool(
+        "debugger", {{"action", "ps4_watch_set"}, {"addr", t.base + 0x108}, {"len", 8}, {"type", 1}}, e);
+    CHECK(!e);
+    if (e) std::printf("  ps4_watch_set err: %s\n", r.dump().c_str());
+    r = slop::core::mcp::call_tool("target", {{"action", "detach"}}, e);
+    CHECK(!e);
+    r = slop::core::mcp::call_tool("debugger", {{"action", "ps4_watch_list"}}, e);
+    CHECK(r.value("count", 0) == 0 || e);   // no local session left to list
+    REQUIRE(TerminateProcess(t.pi.hProcess, 0));
+    CHECK(WaitForSingleObject(t.pi.hProcess, 5000) == WAIT_OBJECT_0);
+}
+
+TEST_CASE(ps4_access_tracer_counts_watchpoint_hits) {
+    // the fake payload stops on every continue while a watchpoint is armed
+    server_guard_t g;
+    ps4_disconnect_guard_t guard;
+    std::string err;
+    REQUIRE(connect_fake_target(g.srv, kFakePid, err));
+    bool e = false;
+    auto dbg = [&](const json& a) { return slop::core::mcp::call_tool("debugger", a, e); };
+    json r = dbg({{"action", "ps4_attach"}, {"pid", kFakePid}});
+    CHECK(!e);
+    r = dbg({{"action", "access_start"}, {"addr", 0x7FFF00001000ull}, {"len", 8},
+             {"kind", "access"}, {"max_hits", 5}});
+    CHECK(!e);
+    if (e) std::printf("  ps4 access_start err: %s\n", r.dump().c_str());
+    const uint64_t id = r.value("id", uint64_t{0});
+    REQUIRE(id != 0);
+    CHECK(r.value("debugger", std::string{}) == "ps4");
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
+        r = dbg({{"action", "access_status"}, {"id", id}});
+        if (e || !r.value("running", true)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK(!e);
+    CHECK(r.value("running", true) == false);
+    CHECK(r.value("stop_reason", std::string{}) == "max_hits");
+    CHECK(r.value("hits", 0) == 5);
+    REQUIRE(r["sites"].is_array() && r["sites"].size() == 1u);
+    CHECK(r["sites"][0].value("rip", 0ull) == 0x400123ull);
+    CHECK(r["sites"][0].value("count", 0) == 5);
+    r = dbg({{"action", "ps4_watch_list"}});
+    CHECK(!e);
+    CHECK(r.value("count", 99) == 0);   // disarmed when max_hits ended it
+
+    // stop on a finished tracer returns the final report
+    r = dbg({{"action", "access_stop"}, {"id", id}});
+    CHECK(!e);
+    CHECK(r.value("hits", 0) == 5);
+    r = dbg({{"action", "access_status"}, {"id", id + 100}});
+    CHECK(e);
+    dbg({{"action", "ps4_detach"}});
+}
+
+TEST_CASE(ps4_access_tracer_refuses_event_stream_actions) {
+    // a running tracer owns the stop events: ps4_wait would steal them
+    server_guard_t g;
+    ps4_disconnect_guard_t guard;
+    std::string err;
+    REQUIRE(connect_fake_target(g.srv, kFakePid, err));
+    bool e = false;
+    auto dbg = [&](const json& a) { return slop::core::mcp::call_tool("debugger", a, e); };
+    json r = dbg({{"action", "ps4_attach"}, {"pid", kFakePid}});
+    CHECK(!e);
+    r = dbg({{"action", "access_start"}, {"addr", 0x7FFF00001000ull}, {"len", 8},
+             {"max_hits", 100000000}});
+    CHECK(!e);
+    if (e) std::printf("  ps4 access_start err: %s\n", r.dump().c_str());
+    const uint64_t id = r.value("id", uint64_t{0});
+    REQUIRE(id != 0);
+
+    r = dbg({{"action", "ps4_wait"}, {"timeout_ms", 100}});
+    CHECK(e);
+    const std::string msg = r.value("error", std::string{});
+    CHECK(msg.find("access tracer " + std::to_string(id)) != std::string::npos);
+    CHECK(msg.find("access_stop") != std::string::npos);
+    dbg({{"action", "ps4_continue"}});
+    CHECK(e);
+
+    r = dbg({{"action", "access_stop"}, {"id", id}});
+    CHECK(!e);
+    r = dbg({{"action", "ps4_wait"}, {"timeout_ms", 100}});
+    CHECK(!e);
+    if (e) std::printf("  ps4_wait after stop err: %s\n", r.dump().c_str());
+    dbg({{"action", "ps4_detach"}});
+}
+
 namespace slop::core::mcp::detail { size_t target_icon_cache_size(); }
 
 TEST_CASE(ps4_target_icon_cache_is_bounded) {

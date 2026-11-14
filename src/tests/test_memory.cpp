@@ -2023,3 +2023,214 @@ TEST_CASE(memory_mcp_exports_csv_ct_and_diff) {
     slop::core::process::target_detach();
     VirtualFree(base, 0, MEM_RELEASE);
 }
+
+TEST_CASE(memory_mcp_scan_pages_with_offset) {
+    using nlohmann::json;
+    auto* base = static_cast<uint8_t*>(
+        VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    REQUIRE(base != nullptr);
+    std::memset(base, 0, 0x1000);
+    const uintptr_t A = reinterpret_cast<uintptr_t>(base);
+    for (int i = 0; i < 5; ++i)
+        *reinterpret_cast<uint32_t*>(base + 0x100 + i * 0x10) = 0x5107A6E5u;
+
+    REQUIRE(slop::core::process::target_attach(GetCurrentProcessId()));
+    bool e = false;
+    mem_call({{"action", "scan_reset"}}, e);
+
+    // first page: two of five rows, next_offset points past them
+    json r = mem_call({{"action", "scan"}, {"kind", "exact"}, {"width", "u32"},
+                       {"value", 0x5107A6E5u}, {"begin", hex_str(A)},
+                       {"end", hex_str(A + 0x1000)}, {"alignment", 4}, {"limit", 2}}, e);
+    CHECK(!e);
+    if (e) std::printf("  paged scan: %s\n", r.dump().c_str());
+    CHECK((r.value("total", size_t{0})) == (size_t{5}));
+    CHECK((r.value("offset", size_t{9})) == (size_t{0}));
+    REQUIRE(r["hits"].size() == 2u);
+    CHECK((r["hits"][0].value("addr", uint64_t{0})) == (uint64_t{A + 0x100}));
+    CHECK((r["hits"][1].value("address", uint64_t{0})) == (uint64_t{A + 0x110}));
+    CHECK(r["next_offset"] == 2);
+
+    // last page of a rescan: one row, next_offset null
+    r = mem_call({{"action", "rescan"}, {"kind", "unchanged"}, {"width", "u32"},
+                  {"offset", 4}, {"limit", 2}}, e);
+    CHECK(!e);
+    CHECK((r.value("total", size_t{0})) == (size_t{5}));
+    REQUIRE(r["hits"].size() == 1u);
+    CHECK((r["hits"][0].value("addr", uint64_t{0})) == (uint64_t{A + 0x140}));
+    CHECK(r["next_offset"].is_null());
+
+    // scan_results pages the stored rows without rescanning
+    r = mem_call({{"action", "scan_results"}, {"offset", 2}, {"limit", 2}}, e);
+    CHECK(!e);
+    CHECK((r.value("total", size_t{0})) == (size_t{5}));
+    REQUIRE(r["results"].size() == 2u);
+    CHECK((r["results"][0].value("address", uint64_t{0})) == (uint64_t{A + 0x120}));
+    CHECK(r["results"][0].contains("address_hex"));
+    CHECK(r["results"][0].contains("formatted"));
+    CHECK(r["next_offset"] == 4);
+    // past the end: empty page, offset clamped to total
+    r = mem_call({{"action", "scan_results"}, {"offset", 50}}, e);
+    CHECK(!e);
+    CHECK(r["results"].empty());
+    CHECK((r.value("offset", size_t{0})) == (size_t{5}));
+    CHECK(r["next_offset"].is_null());
+
+    mem_call({{"action", "scan_reset"}}, e);
+    slop::core::process::target_detach();
+    VirtualFree(base, 0, MEM_RELEASE);
+}
+
+TEST_CASE(watch_history_ring_records_changes_and_heartbeats) {
+    using nlohmann::json;
+    watch::clear();
+    const uint64_t id = watch::add(0x1000, value_width_t::u32, "hist");
+    REQUIRE(id != 0);
+    // a change always lands, a repeat only once a second
+    CHECK(watch::detail::record_sample(id, 1000, 5));
+    CHECK(!watch::detail::record_sample(id, 1500, 5));
+    CHECK(watch::detail::record_sample(id, 2000, 5));
+    CHECK(watch::detail::record_sample(id, 2001, 6));
+    CHECK(!watch::detail::record_sample(id + 999, 3000, 1));   // unknown id
+    std::vector<watch::sample_t> out;
+    REQUIRE(watch::history(id, 256, out));
+    REQUIRE(out.size() == 3u);
+    CHECK(out[0].ms == 1000);
+    CHECK(out[2].bits == 6u);
+
+    // the ring keeps the newest kHistoryCap samples
+    for (uint64_t i = 0; i < 600; ++i)
+        watch::detail::record_sample(id, 3000 + static_cast<int64_t>(i), 100 + i);
+    REQUIRE(watch::history(id, 100000, out));
+    CHECK(out.size() == watch::kHistoryCap);
+    CHECK(out.back().bits == 699u);
+    CHECK(out.front().bits == 699u - (watch::kHistoryCap - 1));
+    // limit takes the newest, oldest first
+    REQUIRE(watch::history(id, 10, out));
+    REQUIRE(out.size() == 10u);
+    CHECK(out[0].bits == 690u);
+    CHECK(out[9].bits == 699u);
+
+    // MCP: same samples with a numeric value
+    bool e = false;
+    json r = mem_call({{"action", "watch_history"}, {"id", id}, {"limit", 3}}, e);
+    CHECK(!e);
+    if (e) std::printf("  watch_history: %s\n", r.dump().c_str());
+    REQUIRE(r["samples"].size() == 3u);
+    CHECK((r["samples"][2].value("bits", uint64_t{0})) == (uint64_t{699}));
+    CHECK(r["samples"][2].value("value", 0.0) == 699.0);
+    CHECK(r["samples"][0].value("ms", int64_t{0}) == 3597);
+
+    // removing the entry drops its history
+    CHECK(watch::remove(id));
+    CHECK(!watch::history(id, 10, out));
+    r = mem_call({{"action", "watch_history"}, {"id", id}}, e);
+    CHECK(e);
+    // clear drops every ring
+    const uint64_t id2 = watch::add(0x2000, value_width_t::u8, "hist2");
+    CHECK(watch::detail::record_sample(id2, 1, 1));
+    watch::clear();
+    CHECK(!watch::history(id2, 10, out));
+}
+
+TEST_CASE(memory_mcp_dump_zero_fills_unreadable_pages) {
+    using nlohmann::json;
+    namespace fs = std::filesystem;
+    // three pages, the middle one reserved only (unreadable)
+    auto* base = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x3000, MEM_RESERVE, PAGE_NOACCESS));
+    REQUIRE(base != nullptr);
+    REQUIRE(VirtualAlloc(base, 0x1000, MEM_COMMIT, PAGE_READWRITE) != nullptr);
+    REQUIRE(VirtualAlloc(base + 0x2000, 0x1000, MEM_COMMIT, PAGE_READWRITE) != nullptr);
+    std::memset(base, 0xA5, 0x1000);
+    std::memset(base + 0x2000, 0x5A, 0x1000);
+    const uintptr_t A = reinterpret_cast<uintptr_t>(base);
+
+    REQUIRE(slop::core::process::target_attach(GetCurrentProcessId()));
+    const fs::path out = fs::temp_directory_path() / "slop_memory_dump_test.bin";
+    const fs::path part = fs::path(out.string() + ".part");
+    fs::remove(out);
+    bool e = false;
+    json r = mem_call({{"action", "dump"}, {"addr", hex_str(A)}, {"len", 0x3000},
+                       {"path", out.string()}}, e);
+    CHECK(!e);
+    if (e) std::printf("  dump: %s\n", r.dump().c_str());
+    CHECK((r.value("bytes_written", uint64_t{0})) == (uint64_t{0x3000}));
+    CHECK((r.value("unreadable_bytes", uint64_t{0})) == (uint64_t{0x1000}));
+    {
+        std::ifstream f(out, std::ios::binary);
+        REQUIRE(f.good());
+        std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        REQUIRE(bytes.size() == 0x3000u);
+        CHECK(bytes[0] == 0xA5);
+        CHECK(bytes[0xFFF] == 0xA5);
+        CHECK(std::all_of(bytes.begin() + 0x1000, bytes.begin() + 0x2000,
+                          [](uint8_t b) { return b == 0; }));
+        CHECK(bytes[0x2000] == 0x5A);
+        CHECK(bytes[0x2FFF] == 0x5A);
+    }
+    CHECK(!fs::exists(part));
+
+    // strict refuses the hole and leaves the previous file intact
+    r = mem_call({{"action", "dump"}, {"addr", hex_str(A)}, {"len", 0x3000},
+                  {"path", out.string()}, {"strict", true}}, e);
+    CHECK(e);
+    CHECK(r.value("error", std::string{}).find("unreadable") != std::string::npos);
+    CHECK(fs::file_size(out) == 0x3000u);
+    CHECK(!fs::exists(part));
+
+    // a span with nothing readable is an error, not a file of zeros
+    const fs::path none = fs::temp_directory_path() / "slop_memory_dump_none.bin";
+    r = mem_call({{"action", "dump"}, {"addr", hex_str(A + 0x1000)}, {"len", 0x1000},
+                  {"path", none.string()}}, e);
+    CHECK(e);
+    CHECK(!fs::exists(none));
+
+    fs::remove(out);
+    slop::core::process::target_detach();
+    VirtualFree(base, 0, MEM_RELEASE);
+}
+
+TEST_CASE(memory_mcp_dump_regions_writes_index) {
+    using nlohmann::json;
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "slop_dump_regions_test";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    REQUIRE(slop::core::process::target_attach(GetCurrentProcessId()));
+    bool e = false;
+    constexpr uint64_t kBudget = 8ull << 20;
+    json r = mem_call({{"action", "dump_regions"}, {"dir", dir.string()}, {"exec_only", true},
+                       {"max_total", kBudget}}, e);
+    CHECK(!e);
+    if (e) std::printf("  dump_regions: %s\n", r.dump().c_str());
+    const size_t n = r.value("regions", size_t{0});
+    const uint64_t written = r.value("bytes_written", uint64_t{0});
+    CHECK(n > 0u);
+    CHECK(written <= kBudget);
+
+    std::ifstream f(dir / "index.json", std::ios::binary);
+    REQUIRE(f.good());
+    const json index = json::parse(f, nullptr, false);
+    f.close();
+    REQUIRE(index.is_array());
+    REQUIRE(index.size() == n);
+    constexpr uint32_t kExecMask = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                               PAGE_EXECUTE_WRITECOPY;
+    uint64_t sum = 0;
+    bool named = false;
+    for (const auto& row : index) {
+        const fs::path file = dir / row.value("file", std::string{});
+        const uint64_t size = row.value("size", uint64_t{0});
+        CHECK(fs::exists(file));
+        CHECK(fs::file_size(file, ec) == size);
+        CHECK((row.value("protect", 0u) & kExecMask) != 0u);
+        CHECK(row.contains("base") && row.contains("type"));
+        if (row["module"].is_string()) named = true;
+        sum += size;
+    }
+    CHECK(sum == written);
+    CHECK(named);   // image code carries its module name
+
+    fs::remove_all(dir, ec);
+    slop::core::process::target_detach();
+}

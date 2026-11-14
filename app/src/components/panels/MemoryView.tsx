@@ -2,7 +2,9 @@
 // Hex editor over live target memory, port of src/ui/view_memory.cpp
 // Region list on the left, 16-bytes-per-row grid on the right, edit in place.
 // The grid scrolls continuously through a 1 MiB window of the region, pages
-// are read as they scroll in; prev/next move the window along the region
+// are read as they scroll in; prev/next move the window along the region.
+// The caret links to watches, typed writes, pointer follow and the access
+// tracer; the bar dumps the window, the region, everything or a minidump
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -11,17 +13,38 @@ import {
   Camera,
   ChevronLeft,
   ChevronRight,
+  Copy,
+  Crosshair,
+  Download,
+  Eye,
+  FileDown,
+  Footprints,
   GitCompare,
+  HardDriveDownload,
+  Layers,
   Microscope,
+  PenLine,
+  Pencil,
   RefreshCw,
+  Waypoints,
   X,
 } from "lucide-react";
 import IconButton from "@/components/IconButton";
+import PointerScanPane from "@/components/panels/PointerScanPane";
 import { useT } from "@/i18n";
+import { copyText } from "@/lib/clipboard";
 import { escapeControl, hex, parseAddress } from "@/lib/format";
+import { encodeTyped, kWriteKinds, type WriteKind } from "@/lib/livemem";
+import { traceAccess } from "@/lib/liveNav";
+import { pickDirectory, pickSavePath } from "@/lib/pickPath";
 import { call, errorText } from "@/lib/rpc";
+import { useDump } from "@/store/dump";
+import { useEngine } from "@/store/engine";
 import { byteAt, kHexCols, kHexRowPx, kWindowBytes, protectName, useMemory } from "@/store/memory";
+import { kParseErrorKeys } from "@/store/scanner";
 import { useTypes } from "@/store/types";
+import { useWatch } from "@/store/watch";
+import "@/styles/livemem.css";
 
 const kRow = kHexRowPx;
 const kCols = kHexCols;
@@ -102,34 +125,113 @@ function bytesOf(text: string): Uint8Array {
 }
 
 /** The caret's bytes as every width the engine can read, little-endian. */
-function interpret(bytes: Uint8Array): { label: string; text: string }[] {
+function interpret(bytes: Uint8Array): { label: string; text: string; watch: boolean }[] {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const has = (n: number) => bytes.byteLength >= n;
   const text = new TextDecoder().decode(bytes).split("\0")[0] ?? "";
   return [
-    { label: "u8", text: has(1) ? String(view.getUint8(0)) : "—" },
-    { label: "u16", text: has(2) ? String(view.getUint16(0, true)) : "—" },
-    { label: "u32", text: has(4) ? String(view.getUint32(0, true)) : "—" },
-    { label: "u64", text: has(8) ? String(view.getBigUint64(0, true)) : "—" },
-    { label: "f32", text: has(4) ? view.getFloat32(0, true).toPrecision(6) : "—" },
-    { label: "f64", text: has(8) ? view.getFloat64(0, true).toPrecision(10) : "—" },
-    { label: "utf8", text: escapeControl(text) },
+    { label: "u8", text: has(1) ? String(view.getUint8(0)) : "—", watch: has(1) },
+    { label: "u16", text: has(2) ? String(view.getUint16(0, true)) : "—", watch: has(2) },
+    { label: "u32", text: has(4) ? String(view.getUint32(0, true)) : "—", watch: has(4) },
+    { label: "u64", text: has(8) ? String(view.getBigUint64(0, true)) : "—", watch: has(8) },
+    { label: "f32", text: has(4) ? view.getFloat32(0, true).toPrecision(6) : "—", watch: has(4) },
+    { label: "f64", text: has(8) ? view.getFloat64(0, true).toPrecision(10) : "—", watch: has(8) },
+    { label: "utf8", text: escapeControl(text), watch: false },
     {
       label: "pointer",
       text: has(8)
         ? `0x${view.getBigUint64(0, true).toString(16).toUpperCase().padStart(16, "0")}`
         : "—",
+      watch: false,
     },
   ];
+}
+
+/** The qword at the caret as an address the grid can jump to, null when it cannot. */
+function pointerAt(bytes: Uint8Array): number | null {
+  if (bytes.byteLength < 8) return null;
+  const v = new DataView(bytes.buffer, bytes.byteOffset, 8).getBigUint64(0, true);
+  // kernel-half pointers exceed a JS number; following them would land elsewhere
+  return v === 0n || v > BigInt(Number.MAX_SAFE_INTEGER) ? null : Number(v);
+}
+
+/** Typed write at the caret: u8..u64, i8..i64, f32/f64, utf-8 text or raw hex bytes. */
+function TypedWrite({ addr, onWritten }: { addr: number; onWritten: () => void }) {
+  const t = useT();
+  const writeBytes = useMemory((s) => s.writeBytes);
+  const [kind, setKind] = useState<WriteKind>("u32");
+  const [text, setText] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async () => {
+    const enc = encodeTyped(kind, text);
+    if (!enc.ok) {
+      setError(t(kParseErrorKeys[enc.error], { value: text, width: kind }));
+      return;
+    }
+    setError(null);
+    if (await writeBytes(addr, enc.value)) onWritten();
+  };
+
+  return (
+    <form
+      className="lm-write"
+      aria-label={t("livemem.write.title", { addr: hex(addr, 1) })}
+      onSubmit={(e) => {
+        e.preventDefault();
+        void submit();
+      }}
+    >
+      <div className="lm-row">
+        <select
+          className="select"
+          aria-label={t("livemem.write.kind")}
+          value={kind}
+          onChange={(e) => setKind(e.target.value as WriteKind)}
+        >
+          {kWriteKinds.map((k) => (
+            <option key={k} value={k}>
+              {k}
+            </option>
+          ))}
+        </select>
+        <input
+          className="addr-input mono lm-grow"
+          aria-label={t("livemem.write.value")}
+          aria-invalid={error !== null}
+          placeholder={kind === "bytes" ? "DE AD BE EF" : t("scanner.valuePlaceholder")}
+          value={text}
+          autoFocus
+          onChange={(e) => {
+            setText(e.target.value);
+            setError(null);
+          }}
+        />
+        <button type="submit" className="row-action lm-fixed" disabled={text === ""}>
+          {t("livemem.write.submit")}
+        </button>
+      </div>
+      {error !== null && (
+        <div className="error-text" role="alert">
+          {error}
+        </div>
+      )}
+    </form>
+  );
 }
 
 /** Side pane: interpreted caret value, plus the selected struct rendered there. */
 function CaretInspector({ addr }: { addr: number }) {
   const t = useT();
   const structType = useTypes((s) => s.selected);
+  const addWatch = useWatch((s) => s.add);
+  const goto = useMemory((s) => s.goto);
   const [bytes, setBytes] = useState<Uint8Array | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [rendered, setRendered] = useState<string | null>(null);
+  const [writing, setWriting] = useState(false);
+  /** Bumped after a write so the values re-read. */
+  const [rev, setRev] = useState(0);
 
   useEffect(() => {
     let alive = true;
@@ -146,7 +248,7 @@ function CaretInspector({ addr }: { addr: number }) {
     return () => {
       alive = false;
     };
-  }, [addr]);
+  }, [addr, rev]);
 
   useEffect(() => {
     if (structType === null) {
@@ -164,16 +266,45 @@ function CaretInspector({ addr }: { addr: number }) {
     return () => {
       alive = false;
     };
-  }, [addr, structType]);
+  }, [addr, structType, rev]);
+
+  const at = hex(addr, 12);
+  const ptr = bytes === null ? null : pointerAt(bytes);
 
   return (
     <div className="mem-inspect">
-      <div className="view-bar" style={{ padding: "var(--pad-sm)" }}>
+      <div className="view-bar lm-wrap" style={{ padding: "var(--pad-sm)" }}>
         <span className="panel-title">{t("memory.caret")}</span>
-        <div className="spacer" />
-        <span className="faint mono">{hex(addr, 12)}</span>
+        <span className="faint mono lm-ellipsis lm-grow" data-tip={at}>
+          {at}
+        </span>
+        <span className="lm-actions-static">
+          <IconButton
+            tip={t("livemem.copyAddress")}
+            onClick={() => void copyText(`0x${hex(addr, 1)}`)}
+          >
+            <Copy size={12} />
+          </IconButton>
+          <IconButton tip={t("livemem.findWrites")} onClick={() => traceAccess(addr, 4, "write")}>
+            <PenLine size={12} />
+          </IconButton>
+          <IconButton
+            tip={t("livemem.findAccesses")}
+            onClick={() => traceAccess(addr, 4, "access")}
+          >
+            <Footprints size={12} />
+          </IconButton>
+          <IconButton
+            tip={t("livemem.write.toggle")}
+            pressed={writing}
+            onClick={() => setWriting((v) => !v)}
+          >
+            <Pencil size={12} />
+          </IconButton>
+        </span>
       </div>
       <div className="panel-body mono mem-values">
+        {writing && <TypedWrite addr={addr} onWritten={() => setRev((r) => r + 1)} />}
         {error !== null && (
           <div className="error-text" role="alert">
             {error}
@@ -181,9 +312,30 @@ function CaretInspector({ addr }: { addr: number }) {
         )}
         {bytes !== null &&
           interpret(bytes).map((r) => (
-            <div key={r.label} className="mem-value">
+            <div key={r.label} className="mem-value lm-value">
               <span className="faint">{r.label}</span>
-              <span>{r.text}</span>
+              <span className="lm-ellipsis lm-grow" data-tip={r.text}>
+                {r.text}
+              </span>
+              {r.watch && (
+                <IconButton
+                  className="lm-mini"
+                  tip={t("livemem.watchAs", { width: r.label })}
+                  onClick={() => void addWatch(addr, r.label)}
+                >
+                  <Eye size={10} />
+                </IconButton>
+              )}
+              {r.label === "pointer" && (
+                <IconButton
+                  className="lm-mini"
+                  tip={t("livemem.followPointer")}
+                  disabled={ptr === null}
+                  onClick={() => ptr !== null && goto(ptr)}
+                >
+                  <Crosshair size={10} />
+                </IconButton>
+              )}
             </div>
           ))}
         {rendered !== null && <pre className="mem-struct">{rendered}</pre>}
@@ -397,7 +549,29 @@ export default function MemoryView() {
   const [dissectAt, setDissectAt] = useState<number | null>(null);
   const [snapOpen, setSnapOpen] = useState(false);
   const [diff, setDiff] = useState<{ base: number; ranges: DiffRange[] } | null>(null);
+  const [ptrOpen, setPtrOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const dump = useDump();
+  const backend = useEngine((s) => s.backend);
+  // MiniDumpWriteDump exists only for a local Windows process
+  const localTarget = !backend.ps4 && !/ps5/i.test(backend.badge);
+  const region = regions.find((r) => cursor >= r.base && cursor < r.base + r.size);
+
+  const dumpSpan = async (base: number, size: number) => {
+    const path = await pickSavePath(
+      t("livemem.dump.spanTitle"),
+      `mem_${hex(base, 1)}_${hex(size, 1)}.bin`,
+    );
+    if (path) await dump.dumpSpan(base, size, path);
+  };
+  const dumpRegions = async () => {
+    const dir = await pickDirectory(t("livemem.dump.regionsTitle"), "memdump");
+    if (dir) await dump.dumpRegions(dir);
+  };
+  const minidump = async () => {
+    const path = await pickSavePath(t("livemem.dump.minidumpTitle"), "target.dmp");
+    if (path) await dump.minidump(path);
+  };
 
   useEffect(() => {
     void loadRegions();
@@ -458,7 +632,7 @@ export default function MemoryView() {
       <RegionList />
 
       <div className="stack">
-        <div className="view-bar">
+        <div className="view-bar lm-wrap">
           <label className="view-label">
             {t("memory.goto")}
             <input
@@ -476,13 +650,59 @@ export default function MemoryView() {
           <IconButton tip={t("memory.gotoTip")} variant="row" onClick={jump}>
             <ArrowRight size={11} />
           </IconButton>
-          <span className="faint mono" style={{ fontSize: 11 }}>
+          <span
+            className="faint mono lm-ellipsis lm-shrink"
+            style={{ fontSize: 11 }}
+            data-tip={
+              windowSize > 0
+                ? `${hex(windowBase, 12)}–${hex(windowBase + windowSize, 12)}`
+                : undefined
+            }
+          >
             {windowSize > 0
               ? `${hex(windowBase, 12)}–${hex(windowBase + windowSize, 12)}`
               : t("memory.noRegion")}
             {loading ? t("memory.readingWindow") : ""}
           </span>
           <div className="spacer" />
+          <IconButton
+            tip={t("livemem.ptr.toggle")}
+            pressed={ptrOpen}
+            disabled={windowSize === 0}
+            onClick={() => setPtrOpen((v) => !v)}
+          >
+            <Waypoints size={13} />
+          </IconButton>
+          <IconButton
+            tip={t("livemem.dump.window")}
+            disabled={windowSize === 0 || dump.busy}
+            onClick={() => void dumpSpan(windowBase, windowSize)}
+          >
+            <Download size={13} />
+          </IconButton>
+          <IconButton
+            tip={t("livemem.dump.region")}
+            disabled={region === undefined || dump.busy}
+            onClick={() => region !== undefined && void dumpSpan(region.base, region.size)}
+          >
+            <HardDriveDownload size={13} />
+          </IconButton>
+          <IconButton
+            tip={t("livemem.dump.regions")}
+            disabled={dump.busy}
+            onClick={() => void dumpRegions()}
+          >
+            <Layers size={13} />
+          </IconButton>
+          {localTarget && (
+            <IconButton
+              tip={t("livemem.dump.minidump")}
+              disabled={dump.busy}
+              onClick={() => void minidump()}
+            >
+              <FileDown size={13} />
+            </IconButton>
+          )}
           <IconButton
             tip={t("memory.snapshotTip")}
             pressed={snapOpen}
@@ -519,6 +739,15 @@ export default function MemoryView() {
           >
             {t("memory.nextShort")} <ChevronRight size={11} />
           </IconButton>
+          {(dump.busy || dump.note !== null || dump.error !== null) && (
+            <span
+              className={`lm-bar-note lm-ellipsis${dump.error !== null ? " error-text" : " faint"}`}
+              role={dump.error !== null ? "alert" : "status"}
+              data-tip={dump.error ?? dump.note ?? undefined}
+            >
+              {dump.busy ? t("livemem.dump.working") : (dump.error ?? dump.note)}
+            </span>
+          )}
         </div>
 
         <div className="panel-body" ref={scrollRef}>
@@ -611,6 +840,7 @@ export default function MemoryView() {
           />
         )}
         {dissectAt !== null && <DissectPane addr={dissectAt} onClose={() => setDissectAt(null)} />}
+        {ptrOpen && <PointerScanPane addr={cursor} onClose={() => setPtrOpen(false)} />}
       </div>
 
       <CaretInspector addr={cursor} />

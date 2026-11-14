@@ -7,6 +7,50 @@ section matching the pushed tag as the GitHub release notes.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-14
+
+### Added
+
+- **Continuous access tracing** (Cheat Engine's "find out what writes/accesses this address"):
+  `debugger.access_start/access_status/access_stop/access_list` arm a hardware watchpoint, keep the
+  target running and count every instruction site that writes, reads or executes the address, with
+  module+offset, disassembly and the last hit's registers. Works on local Windows processes, PS4 and PS5.
+  Event-driving debugger actions are refused while a tracer owns the event stream.
+- **Watch history**: `memory.watch_history` returns timestamped samples (on change, plus a 1 s
+  heartbeat) for every watch entry; the UI shows a sparkline and table per watch.
+- **Scan paging**: `memory.scan`/`rescan` take `offset` and report `total`/`next_offset`;
+  `memory.scan_results` pages the current scan without rescanning.
+- **Dumps**: `memory.dump` streams any span to a file and `memory.dump_regions` writes every committed
+  region plus `index.json`, on every backend; `target.minidump` writes a WinDbg-ready dump of a local
+  process; `target.ps5_dump_module` mirrors the PS4 module dump.
+- **Module dump rebuild**: `target.dump_module` now defaults to a virtual layout (bss/unpacked data
+  survive), sets ImageBase to the runtime base, rebuilds the import table from the live IAT (Scylla
+  style, forwarders and ordinals resolved, into a new `.slopimp` section or the last section) and
+  takes an `oep` override.
+- **UI for live analysis**: results pager, cross-links (scanner hit / watch / hex caret to hex view,
+  watch, find writes, find accesses), typed writes, follow pointer, pointer-scan pane with verify,
+  access-tracer view, dump buttons.
+- **Guides in the UI**: Help → Guides and the command palette list the engine's `guide` playbooks;
+  new playbooks cover access tracing, watch history, process/module dumps and the engine dumpers.
+
+### Changed
+
+- Panel widths follow the window size; the inspector auto-collapses below 1400 px wide (an explicit
+  choice is remembered) and the scanner column can be hidden, so the workspace keeps real width at
+  1100–1680 px.
+- The workspace tab strip scrolls with arrows instead of running under the inspector; status bar,
+  banners, splash and command palette ellipsize or wrap long text; virtual tables share column widths
+  between header and rows.
+- Targets: one console connect area with a PS4/PS5 switch replaces the floating PS5 card.
+
+### Fixed
+
+- `guide.get` produced invalid JSON for playbooks with placeholder parameters.
+- `ps4_watch_set/clear/list` failed on a local Windows debug session.
+- Value-less scan kinds (increased/decreased/changed/unchanged) sent an empty value the engine rejected;
+  scanner values now accept `0x` hex and decimal commas and are validated against the width.
+- Docs described a non-existent `--insecure-dev` flag; browser dev mode uses `SLOP_MCP_TOKEN` + `VITE_SLOP_TOKEN`.
+
 ## [0.3.1] - 2026-11-14
 
 ### Fixed
@@ -274,7 +318,8 @@ section matching the pushed tag as the GitHub release notes.
   live memory, debugger, static analysis and decompiler, Tauri front end and
   MCP server.
 
-[Unreleased]: https://github.com/NetVar1337/SlopStation/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/NetVar1337/SlopStation/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/NetVar1337/SlopStation/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/NetVar1337/SlopStation/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/NetVar1337/SlopStation/compare/v0.2.3...v0.3.0
 [0.1.1]: https://github.com/NetVar1337/PS4-Slop/releases/tag/v0.1.1

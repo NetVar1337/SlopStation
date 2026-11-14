@@ -893,6 +893,7 @@ TEST_CASE(infra_endpoint_probe_and_stale_registration_reap) {
 
     // a live server answers the authenticated round trip
     mcp::server_config_t cfg;
+    cfg.port = 0;   // ephemeral: an installed engine may hold the default port
     cfg.token = std::string(64, 'a');
     REQUIRE(mcp::start(cfg));
     const uint16_t port = mcp::port();

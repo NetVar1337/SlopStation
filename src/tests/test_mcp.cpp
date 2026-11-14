@@ -290,6 +290,36 @@ TEST_CASE(mcp_tool_descriptions_expose_workflow_context) {
     REQUIRE(description("decomp").find("function-start addr") != std::string::npos);
 }
 
+// every guide step must name a real tool and an action in its schema enum, so a
+// playbook (or a renamed action) can never point agents at something missing
+TEST_CASE(mcp_guide_steps_name_existing_actions) {
+    json tools = json::array();
+    slop::core::mcp::list_tools(tools);
+    const auto has_action = [&tools](const std::string& tool, const std::string& action) {
+        const auto it = std::find_if(tools.begin(), tools.end(), [&tool](const json& t) {
+            return t.at("name").get<std::string>() == tool;
+        });
+        if (it == tools.end()) return false;
+        const auto& actions = it->at("inputSchema").at("properties").at("action").at("enum");
+        return std::find(actions.begin(), actions.end(), action) != actions.end();
+    };
+    const json topics = slop::core::mcp::detail::guide_topics();
+    REQUIRE_GT(topics.size(), 20u);
+    for (const auto& t : topics) {
+        const json full = slop::core::mcp::detail::guide_topic(t.at("topic").get<std::string>());
+        REQUIRE(full.is_object());
+        for (const auto& s : full.at("steps")) {
+            const std::string tool = s.at("tool").get<std::string>();
+            const std::string action = s.at("action").get<std::string>();
+            const bool known = has_action(tool, action);
+            if (!known)
+                std::printf("  guide %s names missing %s.%s\n",
+                            t.at("topic").get<std::string>().c_str(), tool.c_str(), action.c_str());
+            CHECK(known);
+        }
+    }
+}
+
 TEST_CASE(mcp_unknown_method_and_tool) {
     server_fixture_t fx;
     json res = fx.rpc("bogus/method");

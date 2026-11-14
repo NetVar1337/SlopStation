@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -381,6 +382,109 @@ def run_battery(b: Battery, target: str, work: Path, port: int) -> None:
     b.case("unknown tool", "zzztool", {"action": "x"}, expect="error")
 
 
+def run_live_battery(b: Battery, target: str, work: Path) -> None:
+    """Live-memory cases against SlopTarget running as a real process (--auto ticks
+    write health/score/speed continuously, gold stays put)."""
+    proc = subprocess.Popen([target, "--auto", "20"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+    addrs: dict[str, str] = {}
+    try:
+        deadline = time.time() + 15
+        while time.time() < deadline and not {"health", "gold", "speed"} <= addrs.keys():
+            line = proc.stdout.readline()
+            if not line:
+                break
+            m = re.search(r"values\.(\w+):\s+(0x[0-9A-Fa-f]+)", line)
+            if m:
+                addrs[m.group(1)] = m.group(2).lower()
+        if not {"health", "gold", "speed"} <= addrs.keys():
+            b.results.append({"label": "live: fixture addresses", "tool": "-", "params": {}, "expect": "ok",
+                              "passed": False, "call_ok": False, "dt": 0, "note": "fixture printed no addresses",
+                              "brief": json.dumps(addrs)})
+            return
+        # keep draining stdout so the fixture never blocks on a full pipe
+        threading.Thread(target=lambda: [None for _ in proc.stdout], daemon=True).start()
+        health, gold, speed = addrs["health"], addrs["gold"], addrs["speed"]
+
+        b.case("live: target.attach", "target", {"action": "attach", "pid": proc.pid},
+               lambda p: "pid %s" % proc.pid)
+        g = b.case("live: memory.read gold", "memory", {"action": "read", "addr": gold, "len": 8, "format": "u64"})
+        gold_val = None
+        try:
+            vals = g["payload"].get("values") or g["payload"].get("data")
+            gold_val = int(vals[0]) if isinstance(vals, list) else None
+        except (TypeError, ValueError, IndexError, AttributeError):
+            gold_val = None
+        if gold_val is not None:
+            b.case("live: memory.scan gold exact", "memory",
+                   {"action": "scan", "kind": "exact", "width": "u64", "value": gold_val, "limit": 1},
+                   lambda p: p.get("total", 0) >= 1 and "next_offset" in p, timeout=120)
+            b.case("live: memory.scan_results paging", "memory", {"action": "scan_results", "offset": 0, "limit": 1},
+                   lambda p: p.get("total", 0) >= 1 and len(p.get("results", [])) == 1
+                   and (p.get("next_offset") == 1 or p.get("total") == 1))
+            b.case("live: scan_results contains gold", "memory",
+                   {"action": "scan_results", "offset": 0, "limit": 10000},
+                   lambda p: any(int(str(r.get("address")), 0) == int(gold, 16) for r in p.get("results", [])))
+
+        w = b.case("live: memory.watch_add speed", "memory",
+                   {"action": "watch_add", "addr": speed, "width": "f32", "label": "speed"})
+        wid = (w["payload"] or {}).get("id")
+        time.sleep(2.5)
+        if wid is not None:
+            b.case("live: memory.watch_history", "memory", {"action": "watch_history", "id": wid, "limit": 64},
+                   lambda p: len(p.get("samples", [])) >= 2)
+            b.case("live: memory.watch_remove", "memory", {"action": "watch_remove", "id": wid})
+
+        span = work / "health_page.bin"
+        b.case("live: memory.dump span", "memory",
+               {"action": "dump", "addr": health, "len": 4096, "path": str(span)},
+               lambda p: span.is_file() and span.stat().st_size == 4096)
+        rdir = work / "regions"
+        b.case("live: memory.dump_regions", "memory",
+               {"action": "dump_regions", "dir": str(rdir), "writable_only": True},
+               lambda p: p.get("regions", 0) > 0 and (rdir / "index.json").is_file(), timeout=180)
+
+        s = b.case("live: debugger.access_start write", "debugger",
+                   {"action": "access_start", "addr": health, "len": 4, "kind": "write"})
+        sid = (s["payload"] or {}).get("id")
+        if sid is not None:
+            time.sleep(2.0)
+            b.case("live: debugger.access_status", "debugger", {"action": "access_status", "id": sid},
+                   lambda p: p.get("hits", 0) > 0 and len(p.get("sites", [])) > 0)
+            b.case("live: debugger.access_list", "debugger", {"action": "access_list"},
+                   lambda p: any(x.get("id") == sid for x in p.get("sessions", [])))
+            b.case("live: debugger.access_stop", "debugger", {"action": "access_stop", "id": sid},
+                   lambda p: p.get("running") is False and p.get("sites"))
+        b.case("live: debugger.ps4_watch_set (local)", "debugger",
+               {"action": "ps4_watch_set", "addr": score_or(addrs, health), "type": 1, "len": 4})
+        b.case("live: debugger.ps4_watch_list (local)", "debugger", {"action": "ps4_watch_list"})
+        b.case("live: debugger.ps4_watch_clear (local)", "debugger",
+               {"action": "ps4_watch_clear", "addr": score_or(addrs, health)})
+
+        dmp = work / "fixture.dmp"
+        b.case("live: target.minidump", "target", {"action": "minidump", "path": str(dmp), "full": False},
+               lambda p: dmp.is_file() and dmp.read_bytes()[:4] == b"MDMP", timeout=120)
+        mod = work / "fixture_dump.exe"
+        b.case("live: target.dump_module rebuild_imports", "target",
+               {"action": "dump_module", "name": Path(target).name, "path": str(mod), "rebuild_imports": True},
+               lambda p: mod.is_file() and (p.get("imports") or {}).get("functions", 0) > 0, timeout=120)
+        b.case("live: re.ue_dump (not an Unreal process)", "re",
+               {"action": "ue_dump", "out_dir": str(work / "ue")}, expect="error", timeout=180)
+        bogus = work / "bogus-metadata.dat"
+        bogus.write_bytes(b"\x00" * 64)
+        b.case("live: re.il2cpp_dump bad metadata", "re",
+               {"action": "il2cpp_dump", "metadata": str(bogus), "binary": target, "out_dir": str(work / "il2cpp")},
+               expect="error")
+        b.case("live: target.detach", "target", {"action": "detach"})
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def score_or(addrs: dict, fallback: str) -> str:
+    return addrs.get("score", fallback)
+
+
 def wait_hype_ready(client: Client, timeout: float) -> None:
     deadline = time.time() + timeout
     last = {}
@@ -440,6 +544,7 @@ def main() -> int:
 
         battery = Battery(client)
         run_battery(battery, target, work, port)
+        run_live_battery(battery, target, work)
     except Exception as e:
         print(f"setup: {e}", file=sys.stderr)
         if engine is not None and engine.log_path.exists():

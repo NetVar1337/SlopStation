@@ -40,6 +40,14 @@ Useful extras on `scan`: `begin`/`end` to bound the range, `alignment` (fastscan
 `tail` (1–8 hex digits, "ends with" fastscan), `writable`/`executable` region filters,
 `max_results`, `threads`, `chunk_bytes`.
 
+`scan` and `rescan` list `limit` rows (default 100, max 10000) starting at `offset`, and
+reply with `total`, `offset` and `next_offset` (`null` on the last page). Walk the stored
+hits without touching the target again:
+
+```json
+{ "tool": "memory", "action": "scan_results", "params": { "offset": 1000, "limit": 1000 } }
+```
+
 ## Watchlist and freeze
 
 ```json
@@ -50,6 +58,16 @@ Useful extras on `scan`: `begin`/`end` to bound the range, `alignment` (fastscan
 
 `watch_add` latches the live value immediately, so a freeze has something to write back;
 `freeze_armed` in the reply tells you whether it actually armed.
+
+Every entry keeps a ring of its last 512 samples: one per service tick when the value
+changed, plus one per second while it holds still. `ms` is wall-clock epoch milliseconds.
+
+```json
+{ "tool": "memory", "action": "watch_history", "params": { "id": 1, "limit": 256 } }
+```
+
+The reply is `{id, width, samples:[{ms, value, bits, text}]}`, oldest first; `value` is
+numeric (floats decoded). Removing or clearing the entry drops its history.
 
 ## AOB and pointer chains
 
@@ -75,6 +93,25 @@ explicit chains (or the last pointerscan of this target) against the current ses
 
 `diff` takes two snapshot ids and returns the changed `offset`/`length` ranges;
 `snapshot_free {id}` releases one, and `snapshots` lists what is held.
+
+## Dumping raw memory
+
+```json
+{ "tool": "memory", "action": "dump",
+  "params": { "addr": "0x200000000", "len": 1048576, "path": "C:/tmp/span.bin" } }
+{ "tool": "memory", "action": "dump_regions",
+  "params": { "dir": "C:/tmp/regions", "writable_only": true } }
+```
+
+`dump` streams any span of the active target (local, PS4, PS5) to `path`. Unreadable pages
+are zero-filled and counted in `unreadable_bytes`; `strict: true` fails instead. The cap is
+4 GiB. The file is written to `<path>.part` and renamed, so a failed dump leaves no torn
+file.
+
+`dump_regions` writes every committed readable region to `<dir>/<base>-<size>.bin` (hex)
+plus `index.json` with `{base, size, protect, type, module, file}` per region. Filter with
+`writable_only` / `exec_only`; `max_total` (default 4 GiB) is a byte budget, and regions
+that do not fit are skipped and counted in `skipped_over_budget`.
 
 ## Dissecting an unknown object
 

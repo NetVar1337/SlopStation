@@ -223,7 +223,7 @@ export default function ScriptsPanel() {
   };
 
   return (
-    <div className="panel">
+    <div className="panel scripts-panel">
       <div className="panel-head">
         <span className="panel-title">{t("scripts.title")}</span>
         <div className="spacer" />
@@ -248,18 +248,8 @@ export default function ScriptsPanel() {
         </IconButton>
       </div>
 
-      <div style={{ display: "flex", minHeight: 0 }}>
-        <aside
-          aria-label={t("scripts.snippets")}
-          style={{
-            width: 170,
-            flex: "0 0 auto",
-            overflowY: "auto",
-            padding: "var(--pad-sm)",
-            borderRight: "1px solid var(--border-soft)",
-            fontSize: 12,
-          }}
-        >
+      <div className="scripts-split">
+        <aside className="scripts-aside" aria-label={t("scripts.snippets")}>
           <div className="faint" style={{ marginBottom: 4 }}>
             {t("scripts.examples")}
           </div>

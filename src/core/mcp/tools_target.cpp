@@ -277,6 +277,7 @@ json tool_target(const json& args) {
     if (action == "attach") {
         const uint64_t pid = parse_addr(args, "pid");
         if (pid == 0 || pid > 0xFFFFFFFFull) fail("bad pid");
+        release_local_debugger();   // never leave the previous process held
         if (!process::target_attach(static_cast<uint32_t>(pid)))
             fail("attach failed (process gone or access denied)");
         g_scan.engine.reset();
@@ -305,6 +306,7 @@ json tool_target(const json& args) {
         g_scan.engine.reset();
         g_scan.used = false;
         g_scan.pid = 0;
+        release_local_debugger();
         process::target_detach();
         return {{"attached", false}};
     }
@@ -1032,6 +1034,15 @@ json tool_target(const json& args) {
 
         process::module_dump_options_t options;
         options.strict_reads = args.value("strict", true);
+        const std::string layout = args.value("layout", std::string("virtual"));
+        if (layout != "virtual" && layout != "file")
+            fail("dump_module: layout must be virtual or file");
+        options.layout = layout == "file" ? process::pe_layout_t::file
+                                          : process::pe_layout_t::virtual_image;
+        options.rebase = args.value("rebase", true);
+        options.rebuild_imports = args.value("rebuild_imports", true);
+        if (args.contains("oep")) options.oep = parse_addr(args, "oep");
+        if (options.rebuild_imports) options.import_modules = modules.items;
         auto result = process::dump_module_pe(session, *selected, output_path, options);
         if (!result.ok) fail("module dump failed: " + result.error);
 
@@ -1044,12 +1055,35 @@ json tool_target(const json& args) {
                 {"path", result.output_path},
                 {"bytes_written", result.bytes_written},
                 {"sections", result.section_count},
+                {"layout", result.layout},
+                {"oep_rva", result.oep_rva},
+                {"imports", {{"modules", result.import_modules},
+                             {"functions", result.import_functions},
+                             {"unresolved", result.import_unresolved}}},
                 {"module", {{"base", static_cast<uint64_t>(selected->base)},
                              {"size", selected->size},
                              {"name", selected->name},
                              {"path", selected->path}}},
                 {"loaded", loaded},
                 {"warnings", result.warnings}};
+    }
+
+    if (action == "minidump") {
+        const auto session_hold = need_session();
+        auto& session = *session_hold;
+        if (dynamic_cast<runtime::backend_ps4_t*>(session.backend()) ||
+            dynamic_cast<runtime::backend_ps5_t*>(session.backend()))
+            fail("minidump works on local Windows targets only; on a console use "
+                 "memory.dump_regions or target.ps4_dump_module / ps5_dump_module");
+        if (!args.contains("path") || !args.at("path").is_string())
+            fail("minidump requires output 'path'");
+        const std::string output_path = args.at("path").get<std::string>();
+        if (output_path.empty()) fail("minidump output path is empty");
+        uint64_t bytes = 0;
+        std::string err;
+        if (!process::write_minidump(session.pid(), output_path, args.value("full", true), bytes, err))
+            fail("minidump failed: " + err);
+        return {{"path", output_path}, {"bytes_written", bytes}};
     }
 
     if (action == "threads") {
@@ -1147,34 +1181,39 @@ json tool_target(const json& args) {
         return {{"heap_base", heap_base}, {"blocks", arr}, {"count", arr.size()}};
     }
 
-    if (action == "ps4_dump_module") {
+    if (action == "ps4_dump_module" || action == "ps5_dump_module") {
         // dump a whole module (every segment of it) from the console over
-        // ps4debug-NG, as the raw mapped span or as a rebuilt loadable ELF
+        // ps4debug-NG (or the PS5 payload, same map protocol), as the raw
+        // mapped span or as a rebuilt loadable ELF
         const auto session_hold = need_session();
         auto& session = *session_hold;
+        const bool ps5 = action == "ps5_dump_module";
         auto* p4 = dynamic_cast<runtime::backend_ps4_t*>(session.backend());
-        if (!p4 || !p4->connected())
-            fail("ps4_dump_module requires a connected console with an attached process "
-                 "(target.ps4_connect {host, pid} or target.ps4_reconnect)");
+        auto* p5 = dynamic_cast<runtime::backend_ps5_t*>(session.backend());
+        if (ps5 ? (!p5 || !p5->connected()) : (!p4 || !p4->connected()))
+            fail(action + " requires a connected console with an attached process "
+                 "(target." + (ps5 ? "ps5" : "ps4") + "_connect {host, pid} or target." +
+                 (ps5 ? "ps5" : "ps4") + "_reconnect)");
         if (!args.contains("path") || !args.at("path").is_string())
-            fail("ps4_dump_module requires output 'path'");
+            fail(action + " requires output 'path'");
         const std::string output_path = args.at("path").get<std::string>();
-        if (output_path.empty()) fail("ps4_dump_module output path is empty");
+        if (output_path.empty()) fail(action + " output path is empty");
         const uint64_t requested_base = args.contains("base") ? parse_addr(args, "base") : 0;
         const std::string requested_name = args.value("name", std::string{});
         if (requested_base == 0 && requested_name.empty())
-            fail("ps4_dump_module requires module 'base' or 'name'");
+            fail(action + " requires module 'base' or 'name'");
         const bool load = args.value("load", false);
         const std::string format = args.value("format", std::string(load ? "elf" : "raw"));
-        if (format != "raw" && format != "elf") fail("ps4_dump_module: format must be raw or elf");
+        if (format != "raw" && format != "elf") fail(action + ": format must be raw or elf");
         if (load && format != "elf")
-            fail("ps4_dump_module: load=true needs format=elf (a raw memory span has no ELF "
+            fail(action + ": load=true needs format=elf (a raw memory span has no ELF "
                  "headers to load)");
 
-        auto modules = p4->ps4_modules(session.handle());
+        auto modules = ps5 ? p5->ps5_modules(session.handle()) : p4->ps4_modules(session.handle());
         if (!modules.ok)
             fail("module enumeration failed on the console: " +
-                 runtime::ps4::io_error_str(modules.error));
+                 (ps5 ? runtime::ps5::io_error_str(modules.error)
+                      : runtime::ps4::io_error_str(modules.error)));
         const runtime::ps4_module_t* selected = nullptr;
         for (const auto& m : modules.items) {
             const bool base_hit = requested_base != 0 &&
@@ -1253,7 +1292,7 @@ json tool_target(const json& args) {
     }
 
     fail("target: unknown action (list|attach|detach|status|modules|"
-         "dump_module|ps4_dump_module|threads|regions|handles|heaps|heap_blocks|icon|"
+         "dump_module|minidump|ps4_dump_module|ps5_dump_module|threads|regions|handles|heaps|heap_blocks|icon|"
          "ps4_connect|ps4_disconnect|ps4_reconnect|ps4_auto|consoles_list|"
          "consoles_save|consoles_remove|consoles_switch)");
 }

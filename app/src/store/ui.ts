@@ -23,7 +23,7 @@ export type WorkspaceTab =
   | "emulate";
 export type OutputTab = "output" | "log";
 
-/** Splitter-driven CSS variables and their defaults (px), see app.css. */
+/** Splitter-driven CSS variables and their largest defaults (px), see app.css. */
 export const kLayoutVars = {
   "--left-w": 300,
   "--scan-w": 316,
@@ -32,23 +32,56 @@ export const kLayoutVars = {
 } as const;
 export type LayoutVar = keyof typeof kLayoutVars;
 
+/** Below this viewport width the inspector starts closed unless the user pinned it. */
+export const kInspectorAutoWidth = 1400;
+
+const clamp = (lo: number, v: number, hi: number) => Math.round(Math.min(hi, Math.max(lo, v)));
+
+/**
+ * Default size of a layout var for a viewport: panels shrink with the window
+ * so the workspace keeps real width at 1100-1366px. A dragged size wins.
+ */
+export function defaultLayoutSize(key: LayoutVar, w: number, h: number): number {
+  switch (key) {
+    case "--left-w":
+      return clamp(220, w * 0.2, kLayoutVars[key]);
+    case "--scan-w":
+      return clamp(250, w * 0.2, kLayoutVars[key]);
+    case "--bottom-h":
+      return clamp(140, h * 0.27, kLayoutVars[key]);
+    case "--right-w":
+      return clamp(240, w * 0.18, kLayoutVars[key]);
+  }
+}
+
+const viewport = () =>
+  typeof window === "undefined"
+    ? { w: 1680, h: 980 }
+    : { w: window.innerWidth, h: window.innerHeight };
+
 type Layout = {
   rail: RailView;
   workspaceTab: WorkspaceTab;
   outputTab: OutputTab;
+  /** Effective state; follows the viewport width until `inspectorPinned`. */
   inspectorOpen: boolean;
+  /** The user opened or closed the inspector explicitly: auto-collapse stops. */
+  inspectorPinned: boolean;
+  scannerOpen: boolean;
   sizes: Partial<Record<LayoutVar, number>>;
 };
 
 const kStorageKey = "reverse-slop.layout";
 
-const kDefaultLayout: Layout = {
+const defaultLayout = (): Layout => ({
   rail: "targets",
   workspaceTab: "disassembly",
   outputTab: "output",
-  inspectorOpen: true,
+  inspectorOpen: viewport().w >= kInspectorAutoWidth,
+  inspectorPinned: false,
+  scannerOpen: true,
   sizes: {},
-};
+});
 
 const kRails: readonly RailView[] = ["targets", "modules", "scripts"];
 const kWorkspaceTabs: readonly WorkspaceTab[] = [
@@ -68,20 +101,25 @@ const kWorkspaceTabs: readonly WorkspaceTab[] = [
 
 /** Parse persisted layout defensively: a hand-edited or stale blob must not break boot. */
 export function parseLayout(raw: string | null): Layout {
-  if (raw === null) return kDefaultLayout;
+  const def = defaultLayout();
+  if (raw === null) return def;
   try {
     const v = JSON.parse(raw) as Partial<Layout>;
+    // Older blobs always wrote inspectorOpen=true; only an explicit close counts as a choice
+    const pinned = v.inspectorPinned === true || v.inspectorOpen === false;
     return {
-      rail: kRails.includes(v.rail as RailView) ? (v.rail as RailView) : kDefaultLayout.rail,
+      rail: kRails.includes(v.rail as RailView) ? (v.rail as RailView) : def.rail,
       workspaceTab: kWorkspaceTabs.includes(v.workspaceTab as WorkspaceTab)
         ? (v.workspaceTab as WorkspaceTab)
-        : kDefaultLayout.workspaceTab,
+        : def.workspaceTab,
       outputTab: v.outputTab === "log" ? "log" : "output",
-      inspectorOpen: v.inspectorOpen !== false,
+      inspectorOpen: pinned ? v.inspectorOpen !== false : def.inspectorOpen,
+      inspectorPinned: pinned,
+      scannerOpen: v.scannerOpen !== false,
       sizes: parseSizes(v.sizes),
     };
   } catch {
-    return kDefaultLayout;
+    return def;
   }
 }
 
@@ -177,7 +215,7 @@ function load(): Layout {
   try {
     return parseLayout(localStorage.getItem(kStorageKey));
   } catch {
-    return kDefaultLayout;
+    return defaultLayout();
   }
 }
 
@@ -192,16 +230,25 @@ function save(layout: Layout): void {
 type UiStore = Layout & {
   settingsOpen: boolean;
   paletteOpen: boolean;
+  /** Live window size (not persisted); drives default panel sizes. */
+  viewportW: number;
+  viewportH: number;
+  /** Guide topic shown in the guide modal, null when closed; "" lists topics. */
+  guideTopic: string | null;
   setRail: (rail: RailView) => void;
   setWorkspaceTab: (tab: WorkspaceTab) => void;
   setOutputTab: (tab: OutputTab) => void;
   setInspectorOpen: (open: boolean) => void;
+  setScannerOpen: (open: boolean) => void;
   setSize: (key: LayoutVar, px: number) => void;
   resetLayout: () => void;
   importLayout: (file: LayoutFile) => void;
   openSettings: () => void;
   closeSettings: () => void;
   setPaletteOpen: (open: boolean) => void;
+  openGuide: (topic: string | null) => void;
+  /** Window resized: refresh the viewport and the unpinned inspector. */
+  onViewport: (w: number, h: number) => void;
 };
 
 export const useUi = create<UiStore>((set, get) => {
@@ -213,20 +260,27 @@ export const useUi = create<UiStore>((set, get) => {
       workspaceTab: s.workspaceTab,
       outputTab: s.outputTab,
       inspectorOpen: s.inspectorOpen,
+      inspectorPinned: s.inspectorPinned,
+      scannerOpen: s.scannerOpen,
       sizes: s.sizes,
     });
   };
+  const vp = viewport();
 
   return {
     ...load(),
     settingsOpen: false,
     paletteOpen: false,
+    viewportW: vp.w,
+    viewportH: vp.h,
+    guideTopic: null,
     setRail: (rail) => update({ rail }),
     setWorkspaceTab: (workspaceTab) => update({ workspaceTab }),
     setOutputTab: (outputTab) => update({ outputTab }),
-    setInspectorOpen: (inspectorOpen) => update({ inspectorOpen }),
+    setInspectorOpen: (inspectorOpen) => update({ inspectorOpen, inspectorPinned: true }),
+    setScannerOpen: (scannerOpen) => update({ scannerOpen }),
     setSize: (key, px) => update({ sizes: { ...get().sizes, [key]: Math.round(px) } }),
-    resetLayout: () => update({ ...kDefaultLayout, sizes: {} }),
+    resetLayout: () => update(defaultLayout()),
     importLayout: (file) => {
       useTheme.getState().setTheme(file.theme);
       useMotion.getState().setMotion(file.motion);
@@ -235,5 +289,12 @@ export const useUi = create<UiStore>((set, get) => {
     openSettings: () => set({ settingsOpen: true, paletteOpen: false }),
     closeSettings: () => set({ settingsOpen: false }),
     setPaletteOpen: (paletteOpen) => set({ paletteOpen }),
+    openGuide: (guideTopic) => set({ guideTopic, paletteOpen: false }),
+    onViewport: (w, h) => {
+      const s = get();
+      const patch: Partial<UiStore> = { viewportW: w, viewportH: h };
+      if (!s.inspectorPinned) patch.inspectorOpen = w >= kInspectorAutoWidth;
+      set(patch);
+    },
   };
 });
