@@ -824,7 +824,10 @@ std::string io_error_str(uint32_t code) {
                                    "in the target process";
     case kErrNotAttached:   return "no ps4 debug session (debugger.ps4_attach first)";
     case kErrAlreadyDebug:  return "the payload is already debugging a process on this "
-                                   "connection (CMD_ALREADY_DEBUG)";
+                                   "connection (CMD_ALREADY_DEBUG); if no debug session is "
+                                   "attached here the console still holds one for a process "
+                                   "that ended (a crashed game) - restart the ps4debug "
+                                   "payload on the console to clear it";
     case kErrDataNull:      return "the payload reported CMD_DATA_NULL (missing data, or the "
                                    "scan family is locked: run debugger.ps4_auth)";
     case kErrTooMuchData:   return "the payload reported CMD_TOO_MUCH_DATA (request too large)";

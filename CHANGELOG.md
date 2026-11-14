@@ -7,6 +7,22 @@ section matching the pushed tag as the GitHub release notes.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-14
+
+### Fixed
+
+- Console module dumps now carry an entry point: PS4's SELF loader never maps the ELF header,
+  so the rebuilt ELF had `e_entry = 0` and the analyzer started at VA 0 (a bogus `entry_point`,
+  only a fraction of the functions found, and `decomp.function` refusing every real address).
+  The entry now falls back to the first executable segment.
+- `CMD_ALREADY_DEBUG` now explains that the console still holds a debug session for a process that
+  ended (a crashed game) and that restarting the ps4debug payload clears it.
+
+### Added
+
+- `tools/ps4_readonly_test.py`: a read-only PS4 feature sweep (attach, memory, scans, dumps,
+  disassembly, snapshots, watch list, script) that never stops, writes or executes in the game.
+
 ## [0.4.0] - 2026-11-14
 
 ### Added
@@ -318,7 +334,8 @@ section matching the pushed tag as the GitHub release notes.
   live memory, debugger, static analysis and decompiler, Tauri front end and
   MCP server.
 
-[Unreleased]: https://github.com/NetVar1337/SlopStation/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/NetVar1337/SlopStation/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/NetVar1337/SlopStation/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/NetVar1337/SlopStation/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/NetVar1337/SlopStation/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/NetVar1337/SlopStation/compare/v0.2.3...v0.3.0

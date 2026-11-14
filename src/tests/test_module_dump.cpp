@@ -230,7 +230,9 @@ TEST_CASE(module_dump_rebuilds_elf_from_segments) {
     CHECK(res.module_base == 0x400000u);
     CHECK(info.segments == 3u);
     CHECK(!info.had_header);
-    CHECK(info.entry == 0u);
+    // no in-memory header: the entry falls back to the first executable segment,
+    // so the analyzer starts at code instead of VA 0
+    CHECK(info.entry == 0x400000u);
     CHECK(!res.warnings.empty());   // says the header was rebuilt
     REQUIRE(out.size() > 64u);
     CHECK(std::memcmp(out.data(), "\x7f" "ELF", 4) == 0);
@@ -238,7 +240,7 @@ TEST_CASE(module_dump_rebuilds_elf_from_segments) {
     CHECK(out[5] == 1);
     CHECK(rd<uint16_t>(out, 16) == 2);    // ET_EXEC
     CHECK(rd<uint16_t>(out, 18) == 62);   // EM_X86_64
-    CHECK(rd<uint64_t>(out, 24) == 0u);   // entry unknown
+    CHECK(rd<uint64_t>(out, 24) == 0x400000u);   // first executable segment
     CHECK(rd<uint64_t>(out, 32) == 64u);  // phoff
     CHECK(rd<uint16_t>(out, 54) == 56);   // phentsize
     REQUIRE(rd<uint16_t>(out, 56) == 3);  // phnum

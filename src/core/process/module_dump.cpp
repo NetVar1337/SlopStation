@@ -1065,6 +1065,23 @@ module_dump_result_t reconstruct_elf_from_segments(
         else if (src.e_entry != 0 && src.e_entry < span) meta.entry = base + src.e_entry; // PIE-relative
     }
 
+    // PS4's SELF loader maps only the segments, so the header (and its entry)
+    // is usually absent: without a start address the analyzer begins at VA 0
+    // and finds almost nothing. The first executable segment is the code.
+    if (meta.entry == 0) {
+        std::vector<size_t> order(n);
+        for (size_t i = 0; i < n; ++i) order[i] = i;
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return segments[a].start < segments[b].start;
+        });
+        for (size_t idx : order) {
+            if ((segments[idx].prot & 4u) != 0) {   // execute, per the p_flags mapping below
+                meta.entry = segments[idx].start;
+                break;
+            }
+        }
+    }
+
     elf64_ehdr_t eh{};
     const uint8_t ident[16] = {0x7F, 'E', 'L', 'F', 2 /*64-bit*/, 1 /*LE*/, 1 /*version*/,
                                9 /*FreeBSD*/, 0, 0, 0, 0, 0, 0, 0, 0};
