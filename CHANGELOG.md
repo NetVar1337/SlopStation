@@ -7,6 +7,15 @@ section matching the pushed tag as the GitHub release notes.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-14
+
+### Fixed
+
+- The desktop app hung on the boot splash ("waiting for the engine to accept connections"):
+  the window CSP allowed only `http:` to the engine, so the 0.3.0 websocket event stream threw
+  and the client retried it forever instead of falling back to SSE. The CSP now allows
+  `ws://127.0.0.1:*`, and a websocket that cannot be created falls back to SSE on the same ticket.
+
 ## [0.3.0] - 2026-11-14
 
 ### Added
@@ -265,6 +274,7 @@ section matching the pushed tag as the GitHub release notes.
   live memory, debugger, static analysis and decompiler, Tauri front end and
   MCP server.
 
-[Unreleased]: https://github.com/NetVar1337/SlopStation/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/NetVar1337/SlopStation/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/NetVar1337/SlopStation/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/NetVar1337/SlopStation/compare/v0.2.3...v0.3.0
 [0.1.1]: https://github.com/NetVar1337/PS4-Slop/releases/tag/v0.1.1

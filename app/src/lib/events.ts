@@ -230,10 +230,17 @@ function openSse(gen: number, ticket: string | null): void {
  * The engine serves the same stream over a websocket, which skips chunked SSE
  * parsing and gives the server a real close handshake. An engine that predates
  * the route answers 404 without spending the ticket, so the first failure
- * silently falls back to SSE.
+ * silently falls back to SSE. A constructor that throws (a CSP without ws:,
+ * no WebSocket at all) never sent the ticket, so SSE reuses it.
  */
 function openWs(gen: number, ticket: string | null): void {
-  const ws = new WebSocket(streamUrl(ticket, true));
+  let ws: WebSocket;
+  try {
+    ws = new WebSocket(streamUrl(ticket, true));
+  } catch {
+    openSse(gen, ticket);
+    return;
+  }
   socket = ws;
   let opened = false;
   ws.onopen = () => {

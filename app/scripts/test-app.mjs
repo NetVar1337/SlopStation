@@ -34,7 +34,10 @@ class FakeSource {
 // takes that path, so the SSE assertions below also cover the fallback.
 class FakeSocket {
   static urls = [];
+  static throws = false;
   constructor(url) {
+    // WebView2 throws here when the CSP's connect-src has no ws: source
+    if (FakeSocket.throws) throw new DOMException("blocked by CSP", "SecurityError");
     this.url = url;
     FakeSocket.urls.push(url);
     setTimeout(() => this.onclose?.(), 0);
@@ -230,6 +233,18 @@ try {
     assert.equal(FakeSource.current.url, "http://127.0.0.1:43123/api/v1/events?ticket=t-123");
     assert.ok(!FakeSource.current.url.includes("secret-token"));
     events.disconnect();
+    // A websocket the page may not open must still reach SSE, on the same
+    // unspent ticket, instead of retrying the blocked socket forever (0.3.0)
+    let tickets = 0;
+    globalThis.fetch = async () => reply({ ticket: `t-${++tickets}` });
+    FakeSocket.throws = true;
+    const blocked = FakeSource.current;
+    events.connect();
+    await until(() => FakeSource.current !== blocked);
+    FakeSocket.throws = false;
+    assert.equal(tickets, 1);
+    assert.equal(FakeSource.current.url, "http://127.0.0.1:43123/api/v1/events?ticket=t-1");
+    events.disconnect();
     setEndpoint({ port: 8765, token: "" });
   }
 
@@ -294,7 +309,7 @@ try {
 
   events.disconnect();
   console.log(
-    "PASS: bounded batched output, duplicate frames, output/watch teardown and remount, function-list refresh on analysis-complete, native endpoint handshake and validation, ticketed event stream, startup snapshot recovery, reconnect and PS4 badge case",
+    "PASS: bounded batched output, duplicate frames, output/watch teardown and remount, function-list refresh on analysis-complete, native endpoint handshake and validation, ticketed event stream, SSE when the websocket is blocked, startup snapshot recovery, reconnect and PS4 badge case",
   );
 } finally {
   await server.close();
