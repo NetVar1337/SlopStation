@@ -76,6 +76,43 @@ json tool_xray(const json& args) {
     json out;
     out["image"] = img_name;
 
+    // score every indexed function for control-flow flattening in one pass,
+    // so a protected binary does not have to be clicked through one function
+    // at a time. Same detector as xray.cff, just applied across the index
+    if (action == "cff_sweep") {
+        if (img.fns == nullptr)
+            fail("cff_sweep: no function index for this image (load it with disasm.load first)");
+        const size_t limit = static_cast<size_t>(
+            std::min<uint64_t>(args.value("limit", 20000u), 200000u));
+        const size_t min_blocks = static_cast<size_t>(
+            std::min<uint64_t>(args.value("min_blocks", 8u), 100000u));
+        const size_t max_report = static_cast<size_t>(
+            std::min<uint64_t>(args.value("max_report", 500u), 10000u));
+        json hits = json::array();
+        size_t scanned = 0, flattened = 0;
+        for (const auto& f : img.fns->functions()) {
+            if (scanned >= limit || hits.size() >= max_report) break;
+            ++scanned;
+            const auto r = xray::detect_cff(img, f.va);
+            if (!r.flattened || r.block_count < min_blocks) continue;
+            ++flattened;
+            json e = {{"va", f.va}, {"va_hex", addr_hex_str(f.va)},
+                      {"block_count", r.block_count},
+                      {"dispatcher", r.dispatcher},
+                      {"dispatcher_backedges", r.dispatcher_backedges},
+                      {"state_variable", r.state_var_desc},
+                      {"state_block_count", r.state_blocks.size()}};
+            hits.push_back(std::move(e));
+        }
+        json sweep = {{"flattened", hits}, {"flattened_count", flattened},
+                      {"functions_scanned", scanned},
+                      {"total_functions", img.fns->functions().size()}};
+        if (hits.empty())
+            sweep["note"] = "no function scored as flattened; raise limit to cover more of the "
+                            "index, or lower min_blocks for small functions";
+        return sweep;
+    }
+
     if (action == "cfg" || action == "complexity" || action == "cff" ||
         action == "obfuscation" || action == "strings_recon" ||
         action == "indirect_calls" || action == "anti_analysis") {

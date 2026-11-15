@@ -3165,8 +3165,73 @@ bool is_composite(const std::string& action) {
 
 // tool: debugger
 
-json tool_debugger(const json& args) {
+// Poll a buffer and capture printable strings as they appear. Games decrypt
+// strings in place on demand, so a static dump of the same bytes shows only
+// ciphertext; watching the buffer over time is what recovers the plaintext.
+// Works on any backend (console or local), no debugger session needed.
+json harvest_strings(const json& args, const infra::cancel_token_t& cancel) {
+    const auto s_hold = need_session();
+    auto& s = *s_hold;
+    const uint64_t addr = parse_addr(args, "addr");
+    const uint64_t len = std::min<uint64_t>(parse_addr_alias(args, {"len", "size"}), 64ull << 20);
+    if (len == 0) fail("harvest_strings: len must be greater than 0");
+    const auto clamp_u64 = [&](const char* key, uint64_t def, uint64_t lo, uint64_t hi) {
+        const auto& v = args.contains(key) ? args.at(key) : json(def);
+        uint64_t x = def;
+        if (v.is_number_unsigned()) x = v.get<uint64_t>();
+        else if (v.is_number_integer() && v.get<int64_t>() >= 0) x = static_cast<uint64_t>(v.get<int64_t>());
+        return std::max<uint64_t>(std::min<uint64_t>(x, hi), lo);
+    };
+    const int64_t duration_ms = static_cast<int64_t>(clamp_u64("duration_ms", 5000, 100, 600000));
+    const int64_t interval_ms = static_cast<int64_t>(clamp_u64("interval_ms", 100, 10, 5000));
+    const size_t min_len = static_cast<size_t>(clamp_u64("min_len", 4, 1, 256));
+    const size_t max_strings = static_cast<size_t>(clamp_u64("max_strings", 4096, 1, 100000));
+
+    const auto printable = [](uint8_t ch) { return ch >= 0x20 && ch < 0x7F; };
+    std::set<std::string> seen;
+    json found = json::array();
+    std::vector<uint8_t> buf(static_cast<size_t>(len));
+    const int64_t start = infra::steady_ms();
+    size_t passes = 0, readable = 0;
+    while (infra::steady_ms() - start < duration_ms && found.size() < max_strings) {
+        if (cancel.cancelled()) break;
+        ++passes;
+        auto io = s.read(static_cast<uintptr_t>(addr), buf.data(), buf.size());
+        if (io.ok && io.bytes == buf.size()) {
+            ++readable;
+            const int64_t at = infra::steady_ms() - start;
+            size_t i = 0;
+            while (i < buf.size() && found.size() < max_strings) {
+                if (!printable(buf[i])) { ++i; continue; }
+                size_t j = i;
+                while (j < buf.size() && printable(buf[j])) ++j;
+                const size_t n = j - i;
+                if (n >= min_len) {
+                    std::string text(reinterpret_cast<const char*>(buf.data() + i), n);
+                    if (seen.insert(text).second)
+                        found.push_back({{"addr", addr + i},
+                                         {"addr_hex", addr_hex_str(addr + i)},
+                                         {"text", text}, {"len", n}, {"at_ms", at}});
+                }
+                i = j;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+    }
+    json out = {{"found", found}, {"count", found.size()},
+                {"passes", passes}, {"readable_passes", readable},
+                {"elapsed_ms", infra::steady_ms() - start},
+                {"addr", addr}, {"addr_hex", addr_hex_str(addr)}, {"len", len}};
+    if (found.empty())
+        out["note"] = "nothing decrypted in the window: widen duration_ms, or trigger the code "
+                      "path that decrypts (open a menu, spawn, load a map). memory.watch_add + "
+                      "debugger.ps4_find_write locates the decrypt routine";
+    return out;
+}
+
+json tool_debugger(const json& args, const infra::cancel_token_t& cancel) {
     const std::string action = require_action(args);
+    if (action == "harvest_strings") return harvest_strings(args, cancel);
     // continuous access tracer: local Win32 debugger, PS4 or PS5 console
     if (action.rfind("access_", 0) == 0) return tool_debugger_access(action, args);
     refuse_while_tracing(action);

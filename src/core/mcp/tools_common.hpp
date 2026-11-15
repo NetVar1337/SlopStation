@@ -198,7 +198,7 @@ json app_state_unlocked();   // caller holds g_tool_mu
 json tool_target(const json& args, const infra::cancel_token_t& cancel = {});
 json tool_memory(const json& args, const infra::cancel_token_t& cancel = {});
 json tool_disasm(const json& args);
-json tool_debugger(const json& args);
+json tool_debugger(const json& args, const infra::cancel_token_t& cancel = {});
 json tool_emulate(const json& args, infra::cancel_token_t cancel);
 json tool_analyze(const json& args, const infra::cancel_token_t& cancel = {});
 json tool_network(const json& args);

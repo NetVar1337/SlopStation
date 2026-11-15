@@ -238,11 +238,28 @@ void page_fields(json& out, size_t total, size_t offset, size_t returned) {
 
 // one readable span streamed to out: a failed chunk is retried page by page
 // and unreadable pages are zero-filled (counted) unless strict
+// one unreadable run inside a dumped span, as an offset from the span start
+struct hole_t {
+    uint64_t off  = 0;
+    uint64_t size = 0;
+};
+
 struct span_dump_t {
     uint64_t    written = 0;
     uint64_t    unreadable = 0;
+    std::vector<hole_t> holes;   // merged, ascending; lets the caller retry
     std::string error;   // set on a strict hole or a file write failure
 };
+
+// append a hole, merging it into the previous one when they are adjacent
+void note_hole(std::vector<hole_t>& holes, uint64_t off, uint64_t size) {
+    if (size == 0) return;
+    if (!holes.empty() && holes.back().off + holes.back().size == off) {
+        holes.back().size += size;
+        return;
+    }
+    holes.push_back({off, size});
+}
 
 span_dump_t stream_span(runtime::session_t& s, uint64_t addr, uint64_t len, std::ofstream& out,
                         bool strict, size_t chunk,
@@ -280,6 +297,7 @@ span_dump_t stream_span(runtime::session_t& s, uint64_t addr, uint64_t len, std:
                     }
                     std::memset(cur + p, 0, step);
                     r.unreadable += step;
+                    note_hole(r.holes, off + p, step);
                 }
                 p += step;
             }
@@ -327,7 +345,7 @@ json tool_memory(const json& args, const infra::cancel_token_t& cancel) {
             "live_crypto", "watch_list", "watch_add", "watch_remove",
             "watch_clear", "watch_set", "watch_undo", "watch_freeze_once",
             "watch_export_ct", "watch_import_ct", "watch_history",
-            "offsets_verify", "offsets_build", "offsets_diff", "globals", "dissect", "dump", "dump_regions",
+            "offsets_verify", "offsets_build", "offsets_diff", "globals", "dissect", "dump", "dump_regions", "dump_holes", "dynamic_code",
         };
         const bool known = std::any_of(std::begin(kKnown), std::end(kKnown),
                                         [&](const char* k) { return action == k; });
@@ -1086,9 +1104,19 @@ json tool_memory(const json& args, const infra::cancel_token_t& cancel) {
             }
             if (!commit_file(tmp, dst)) fail("memory.dump: cannot replace " + path);
             dump_progress().finish();
-            return {{"path", path}, {"addr", addr}, {"addr_hex", addr_hex_str(addr)},
-                    {"len", len}, {"bytes_written", r.written},
-                    {"unreadable_bytes", r.unreadable}, {"complete", r.unreadable == 0}};
+            json holes = json::array();
+            for (const auto& h : r.holes)
+                holes.push_back({{"addr", addr + h.off}, {"addr_hex", addr_hex_str(addr + h.off)},
+                                 {"size", h.size}, {"offset", h.off}});
+            json out = {{"path", path}, {"addr", addr}, {"addr_hex", addr_hex_str(addr)},
+                        {"len", len}, {"bytes_written", r.written},
+                        {"unreadable_bytes", r.unreadable},
+                        {"complete", r.unreadable == 0}, {"holes", holes}};
+            if (!r.holes.empty())
+                out["retry_hint"] = "memory.dump_holes {path, addr, len, holes} re-reads just "
+                                    "these spans and patches them into the file once the game "
+                                    "maps them";
+            return out;
         }
 
         // dump_regions: every committed readable region plus index.json
@@ -1166,6 +1194,13 @@ json tool_memory(const json& args, const infra::cancel_token_t& cancel) {
                              {"protect", r.protect}, {"type", r.type},
                              {"module", module}, {"file", std::string(name)},
                              {"unreadable_bytes", sd.unreadable}});
+            if (!sd.holes.empty()) {
+                json rh = json::array();
+                for (const auto& h : sd.holes)
+                    rh.push_back({{"addr", static_cast<uint64_t>(r.base) + h.off},
+                                  {"size", h.size}});
+                index.back()["holes"] = std::move(rh);
+            }
         }
         const fs::path index_path = dir / "index.json";
         if (!infra::paths::write_file_atomic(index_path.string(), index.dump(2)))
@@ -1175,6 +1210,135 @@ json tool_memory(const json& args, const infra::cancel_token_t& cancel) {
                 {"unreadable_bytes", unreadable}, {"index_path", index_path.string()},
                 {"skipped_over_budget", over_budget}, {"skipped_unreadable", vanished},
                 {"truncated", over_budget > 0}};
+    }
+
+    // re-read only the spans a previous dump could not read and patch them
+    // into that file in place. A dump is rarely 100% on a live process (guard
+    // pages, not-yet-mapped regions); this turns the gaps into a retry list
+    // instead of a whole second dump
+    if (action == "dump_holes") {
+        namespace fs = std::filesystem;
+        const uint64_t addr = parse_addr(args, "addr");
+        const uint64_t len = parse_addr_alias(args, {"len", "size"});
+        if (len == 0) fail("memory.dump_holes: len must be greater than 0");
+        const std::string path = opt_str(args, "path", "");
+        if (path.empty()) fail("memory.dump_holes requires 'path' (the dump to patch)");
+        if (!args.contains("holes") || !args.at("holes").is_array())
+            fail("memory.dump_holes requires 'holes' (the array memory.dump returned)");
+        std::error_code ec;
+        const fs::path file(path);
+        const uint64_t have = fs::exists(file, ec) ? fs::file_size(file, ec) : 0;
+        if (have != len)
+            fail("memory.dump_holes: " + path + " is " + std::to_string(have) +
+                 " bytes, expected " + std::to_string(len) + " (addr/len must match the dump)");
+
+        std::fstream f(file, std::ios::binary | std::ios::in | std::ios::out);
+        if (!f) fail("memory.dump_holes: cannot open " + path + " for writing");
+        const size_t chunk = s.backend()->kind() == runtime::backend_kind_t::user_mode
+                                 ? (1u << 20) : (8u << 20);
+        std::vector<uint8_t> buf;
+        uint64_t filled = 0, still = 0;
+        json remaining = json::array();
+        for (const auto& h : args.at("holes")) {
+            if (!h.is_object()) continue;
+            if (cancel.cancelled()) fail("memory.dump_holes: cancelled");
+            uint64_t ha = 0, hs = 0;
+            const auto& a = h.contains("addr") ? h.at("addr") : h.at("offset");
+            if (a.is_number_unsigned()) ha = a.get<uint64_t>();
+            else if (a.is_string()) { try { ha = std::stoull(a.get<std::string>(), nullptr, 0); } catch (...) { continue; } }
+            else continue;
+            if (h.contains("size") && h.at("size").is_number_unsigned())
+                hs = h.at("size").get<uint64_t>();
+            if (hs == 0 || ha < addr || ha + hs > addr + len) continue;
+            const uint64_t off = ha - addr;
+            buf.assign(static_cast<size_t>(hs), 0);
+            bool ok = true;
+            for (uint64_t p = 0; p < hs;) {
+                const size_t take = static_cast<size_t>(std::min<uint64_t>(chunk, hs - p));
+                auto io = s.read(static_cast<uintptr_t>(ha + p), buf.data() + p, take);
+                if (!io.ok || io.bytes != take) { ok = false; break; }
+                p += take;
+            }
+            if (!ok) {
+                still += hs;
+                remaining.push_back({{"addr", ha}, {"size", hs}});
+                continue;
+            }
+            f.seekp(static_cast<std::streamoff>(off), std::ios::beg);
+            f.write(reinterpret_cast<const char*>(buf.data()),
+                    static_cast<std::streamsize>(hs));
+            if (!f) fail("memory.dump_holes: write failed at offset " + std::to_string(off));
+            filled += hs;
+        }
+        f.flush();
+        if (!f) fail("memory.dump_holes: flush failed");
+        return {{"path", path}, {"holes_filled", filled}, {"bytes_filled", filled},
+                {"still_unreadable", still}, {"remaining", remaining},
+                {"complete", still == 0}};
+    }
+
+    // executable memory that belongs to no module: JIT output, runtime-unpacked
+    // stubs, generated thunks. A module dump structurally cannot see these, so
+    // list them (and optionally dump them) separately
+    if (action == "dynamic_code") {
+        namespace fs = std::filesystem;
+        constexpr uint32_t kExec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                   PAGE_EXECUTE_WRITECOPY;
+        auto regions = runtime::target_scan_regions(s.handle());
+        std::sort(regions.begin(), regions.end(),
+                  [](const auto& a, const auto& b) { return a.base < b.base; });
+        auto mods = s.backend()->enum_modules(s.handle());
+        const auto in_module = [&](uint64_t a) {
+            if (!mods.ok) return false;
+            for (const auto& m : mods.items)
+                if (a >= m.base && a < m.base + m.size) return true;
+            return false;
+        };
+        json hits = json::array();
+        const std::string dir_s = opt_str(args, "dir", "");
+        const bool dump = !dir_s.empty();
+        fs::path dir;
+        std::error_code ec;
+        if (dump) {
+            dir = fs::path(dir_s);
+            fs::create_directories(dir, ec);
+            if (!fs::is_directory(dir, ec))
+                fail("memory.dynamic_code: cannot create " + dir_s);
+        }
+        uint64_t total = 0;
+        for (const auto& r : regions) {
+            if (r.protect == 0 || (r.protect & PAGE_NOACCESS)) continue;
+            if (!(r.protect & kExec)) continue;
+            if (in_module(r.base)) continue;
+            json e = {{"base", static_cast<uint64_t>(r.base)},
+                      {"base_hex", addr_hex_str(r.base)},
+                      {"size", static_cast<uint64_t>(r.size)},
+                      {"protect", r.protect}, {"type", r.type}};
+            if (dump) {
+                char name[64];
+                std::snprintf(name, sizeof(name), "dyn-%llX-%llX.bin",
+                              static_cast<unsigned long long>(r.base),
+                              static_cast<unsigned long long>(r.size));
+                const fs::path out = dir / name;
+                std::ofstream f(out, std::ios::binary | std::ios::trunc);
+                if (f) {
+                    span_dump_t sd = stream_span(s, r.base, r.size, f, false, 1u << 20, cancel);
+                    f.close();
+                    if (sd.error.empty()) {
+                        e["file"] = out.string();
+                        e["unreadable_bytes"] = sd.unreadable;
+                        total += sd.written;
+                    }
+                }
+            }
+            hits.push_back(std::move(e));
+        }
+        json out = {{"regions", hits}, {"count", hits.size()}};
+        if (dump) out["bytes_written"] = total;
+        if (hits.empty())
+            out["note"] = "no executable memory outside the loaded modules (nothing JIT'd or "
+                          "unpacked right now; try again after the game has run a while)";
+        return out;
     }
 
     if (action == "write") {

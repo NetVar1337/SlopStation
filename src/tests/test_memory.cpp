@@ -2185,11 +2185,97 @@ TEST_CASE(memory_mcp_dump_zero_fills_unreadable_pages) {
     CHECK(e);
     CHECK(!fs::exists(none));
 
+    // a fresh non-strict dump reports the unreadable page as a retryable span
+    json d2 = mem_call({{"action", "dump"}, {"addr", hex_str(A)}, {"len", 0x3000},
+                        {"path", out.string()}}, e);
+    REQUIRE(!e);
+    REQUIRE(d2.contains("holes"));
+    REQUIRE(d2["holes"].is_array());
+    REQUIRE(d2["holes"].size() == 1);
+    CHECK((d2["holes"][0].value("addr", uint64_t{0})) == (A + 0x1000));
+    CHECK((d2["holes"][0].value("size", uint64_t{0})) == (uint64_t{0x1000}));
+    CHECK((d2["holes"][0].value("offset", uint64_t{0})) == (uint64_t{0x1000}));
+
+    // the hole is still unreadable here: nothing is filled and it stays listed
+    json hr = mem_call({{"action", "dump_holes"}, {"addr", hex_str(A)}, {"len", 0x3000},
+                        {"path", out.string()}, {"holes", d2["holes"]}}, e);
+    CHECK(!e);
+    CHECK((hr.value("bytes_filled", uint64_t{0})) == uint64_t{0});
+    CHECK(!hr.value("complete", true));
+    CHECK(hr["remaining"].size() == 1);
+
+    // once it becomes readable, dump_holes patches just that span in
+    REQUIRE(VirtualAlloc(base + 0x1000, 0x1000, MEM_COMMIT, PAGE_READWRITE) != nullptr);
+    std::memset(base + 0x1000, 0x3C, 0x1000);
+    hr = mem_call({{"action", "dump_holes"}, {"addr", hex_str(A)}, {"len", 0x3000},
+                   {"path", out.string()}, {"holes", d2["holes"]}}, e);
+    CHECK(!e);
+    CHECK((hr.value("bytes_filled", uint64_t{0})) == (uint64_t{0x1000}));
+    CHECK(hr.value("complete", false));
+    {
+        std::ifstream f(out, std::ios::binary);
+        REQUIRE(f.good());
+        std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)),
+                                   std::istreambuf_iterator<char>());
+        REQUIRE(bytes.size() == 0x3000u);
+        CHECK(bytes[0x1000] == 0x3C);   // the hole is now filled
+        CHECK(bytes[0x1FFF] == 0x3C);
+        CHECK(bytes[0] == 0xA5);        // untouched spans survive
+        CHECK(bytes[0x2000] == 0x5A);
+    }
+
     fs::remove(out);
     slop::core::process::target_detach();
     VirtualFree(base, 0, MEM_RELEASE);
 }
 
+TEST_CASE(debugger_harvest_strings_captures_new_plaintext) {
+    using nlohmann::json;
+    // a buffer that starts as noise and gets "decrypted" mid-window: the
+    // harvester must report only the strings that appeared, deduplicated
+    auto* buf = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE,
+                                                  PAGE_READWRITE));
+    REQUIRE(buf != nullptr);
+    std::memset(buf, 0x00, 0x1000);
+    const uintptr_t A = reinterpret_cast<uintptr_t>(buf);
+    REQUIRE(slop::core::process::target_attach(GetCurrentProcessId()));
+
+    std::atomic<bool> stop{false};
+    std::thread writer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        std::memcpy(buf, "player_health", 13);
+        std::memcpy(buf + 0x40, "sv_cheats", 9);
+        std::memcpy(buf + 0x80, "player_health", 13);   // duplicate on purpose
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        stop = true;
+    });
+
+    bool e = false;
+    json r = slop::core::mcp::call_tool("debugger",
+        {{"action", "harvest_strings"}, {"addr", hex_str(A)}, {"len", 0x1000},
+         {"duration_ms", 900}, {"interval_ms", 20}, {"min_len", 4}}, e);
+    writer.join();
+    stop = true;
+    CHECK(!e);
+    if (e) std::printf("  harvest: %s\n", r.dump().c_str());
+    REQUIRE(r.contains("found"));
+    CHECK(r.value("count", size_t{0}) >= 2);
+
+    bool saw_health = false, saw_cheats = false;
+    size_t health_hits = 0;
+    for (const auto& f : r["found"]) {
+        const std::string text = f.value("text", std::string{});
+        if (text == "player_health") { saw_health = true; ++health_hits; }
+        if (text == "sv_cheats") saw_cheats = true;
+        CHECK(f.value("len", size_t{0}) >= 4);
+    }
+    CHECK(saw_health);
+    CHECK(saw_cheats);
+    CHECK(health_hits == 1);   // deduplicated across passes and addresses
+
+    slop::core::process::target_detach();
+    VirtualFree(buf, 0, MEM_RELEASE);
+}
 TEST_CASE(memory_mcp_dump_regions_writes_index) {
     using nlohmann::json;
     namespace fs = std::filesystem;
