@@ -9,6 +9,30 @@ section matching the pushed tag as the GitHub release notes.
 
 ### Added
 
+- `memory.offsets_build`: generate an `offsets_verify` manifest from named
+  addresses. Each offset gets an anchor pattern decoded in place and grown until
+  it is unique inside the module's executable segment, plus that segment's
+  SHA-256 as the build fingerprint. `aob_offset` shifts the anchor back from the
+  target; offsets with no unique anchor are reported in `problems[]`.
+- `memory.offsets_diff`: compare two manifests or two `netvars.json` dumps across
+  builds and report stable / moved / missing / added with a
+  compatible|moved|broken verdict.
+- `memory.globals`: find the static globals a function touches by collecting
+  every RIP-relative memory operand whose target lands in a module's data
+  section, deduplicated per target with module-relative RVAs.
+- `re.source_dump` writes `offsets.hpp` (one `constexpr` per netvar, grouped by
+  declaring table, sanitized to C++ identifiers) and, with `datamaps: true`,
+  `datamaps.json` for non-networked DataMap fields. A DataMap candidate is
+  accepted only when its class name and every field record validate.
+- `.eh_frame` unwinding (`debugger.ps4_callstack`): a DWARF CFI interpreter
+  recovers callers on ELF targets without a frame pointer, which is the PS4 case
+  (no `.pdata`, optimized eboots drop rbp). It uses the loaded image's
+  `.eh_frame` when it matches the module, or an explicit
+  `eh_frame_va`/`eh_frame_size`, and falls back to the rbp chain; the reply names
+  the `unwinder` that produced the frames.
+- UI: a **Dumpers** workspace tab drives `ue_dump` / `il2cpp_dump` /
+  `source_dump` and the offset-manifest build/diff helpers, showing counters,
+  written files and warnings.
 - `re.source_dump`: Source engine (Titanfall-derived, e.g. Apex Legends PS4) netvar dumper
   over the live target. Locates the ClientClass linked list by structural validation in
   the module's writable sections (or takes an explicit `head`), walks every
