@@ -173,10 +173,23 @@ located without a signature.
 
 `re.source_dump` also writes `offsets.hpp` (one `constexpr` per netvar, grouped
 by declaring table, in the shape a payload SDK consumes) and, with
-`datamaps: true`, `datamaps.json` for the non-networked DataMap fields. The
-DataMap layout drifts between engine branches, so a candidate is accepted only
-when its own class-name string and every field record validate; nothing
-validating is a warning, not a wrong dump.
+`datamaps: true`, `datamaps.json` for the non-networked DataMap fields.
+
+The DataMap layout is not guessed: it was verified against the Apex Legends
+CL11700487 eboot (`Reversal/ApexLegends`). A `datamap_t` is `dataDesc` at
++0x00, `dataNumFields` at +0x08 and `dataClassName` at +0x10; the
+`typedescription_t` records are **0x80 bytes** apart with `fieldType` at
++0x00, `fieldName` at +0x08, `fieldOffset` at +0x10 and the element count at
++0x14. Field names carry dots for nested members (`m_params.windDir`), which
+the curated header renders as underscores. The `baseMap` link is not a
+pointer in this build, so no inheritance chain is claimed.
+
+That layout reproduces 47 of the 48 datamaps in
+`apex-convars-datamaps.hpp` with an exact field name, offset and type match,
+and no mismatches. The one miss is `C_BaseEntity_202f6b0`, a synthesized
+fallback name whose string is not present in the binary at all. A candidate
+is still accepted only when its class name and every field record validate, so
+an engine branch that moves these fields yields a warning, not a wrong dump.
 
 ## Long dumps
 

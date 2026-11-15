@@ -142,3 +142,22 @@ The **Debugger** tab shows the same state: a **Continue** button, a step control
 columns, **Breakpoints** and **Watchpoints (DR)** lists with address/type/length inputs, the
 event feed, and the dump row (**dump+load**). Before a console is attached it offers
 **Attach debugger (ps4debug)**.
+
+## Unwinding a console callstack
+
+`debugger.ps4_callstack` tries DWARF CFI first. PS4 eboots are ELF with no
+`.pdata`, and optimized builds drop the frame pointer, so the rbp chain breaks
+exactly where a console callstack matters. The `.eh_frame` interpreter reads
+the CIE/FDE records, the common `DW_EH_PE` encodings and the CFA /
+return-address rules, and evaluates DWARF expressions
+(`DW_CFA_def_cfa_expression`, `DW_CFA_expression`, `DW_CFA_val_expression`),
+which real eboots do emit.
+
+The section comes from the loaded image when it matches the module, or from an
+explicit `eh_frame_va`/`eh_frame_size`. `no_eh_frame: true` forces the rbp
+chain. The reply's `unwinder` field names which path produced the frames, so a
+fallback is visible rather than silent.
+
+Expressions are evaluated against `rip`, `rsp` and `rbp` only. An expression
+that needs any other register, reads unmapped memory, or uses an opcode outside
+the supported subset ends the walk instead of inventing a frame address.

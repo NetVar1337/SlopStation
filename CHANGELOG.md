@@ -22,8 +22,18 @@ section matching the pushed tag as the GitHub release notes.
   section, deduplicated per target with module-relative RVAs.
 - `re.source_dump` writes `offsets.hpp` (one `constexpr` per netvar, grouped by
   declaring table, sanitized to C++ identifiers) and, with `datamaps: true`,
-  `datamaps.json` for non-networked DataMap fields. A DataMap candidate is
-  accepted only when its class name and every field record validate.
+  `datamaps.json` for non-networked DataMap fields.
+- DataMap walking uses the layout verified against the Apex CL11700487 eboot:
+  0x80-byte `typedescription_t` records with `fieldType` +0x00, `fieldName`
+  +0x08, `fieldOffset` +0x10 and the element count at +0x14, and dotted field
+  names for nested members (`m_params.windDir`). It reproduces 47 of the 48
+  datamaps in `apex-convars-datamaps.hpp` exactly, with no mismatches; the
+  remaining one is a synthesized fallback name absent from the binary.
+- `.eh_frame` unwinding evaluates DWARF expressions
+  (`DW_CFA_def_cfa_expression`, `DW_CFA_expression`, `DW_CFA_val_expression`)
+  instead of ending the walk, so real eboots unwind without a frame pointer.
+  Expressions resolve against `rip`/`rsp`/`rbp`; one needing another register
+  fails closed rather than guessing.
 - `.eh_frame` unwinding (`debugger.ps4_callstack`): a DWARF CFI interpreter
   recovers callers on ELF targets without a frame pointer, which is the PS4 case
   (no `.pdata`, optimized eboots drop rbp). It uses the loaded image's
