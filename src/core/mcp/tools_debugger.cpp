@@ -2071,8 +2071,63 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
         auto io = p.get_thread_context(lwpid, ctx);
         if (!io.ok) io_fail("ps4_callstack: cannot read regs of lwpid " + std::to_string(lwpid), io);
         dbg::ps4_debug_target_t t(p, s_hold);
-        json arr = frames_json(dbg::rbp_frames(t, ctx, depth));
-        return {{"lwpid", lwpid}, {"frames", arr}, {"count", arr.size()}};
+
+        // PS4 eboots are ELF with no .pdata, and optimized builds drop the
+        // frame pointer, so try DWARF CFI first: an explicit eh_frame_va/size,
+        // else the .eh_frame of the loaded image when it matches this module
+        uint64_t eh_va = args.contains("eh_frame_va") ? parse_addr(args, "eh_frame_va") : 0;
+        uint64_t eh_size = args.contains("eh_frame_size") ? parse_addr(args, "eh_frame_size") : 0;
+        if ((eh_va == 0 || eh_size == 0) && !args.contains("no_eh_frame")) {
+            std::lock_guard lk(ds::state_mutex());
+            auto& bin = ds::get();
+            if (bin.ready) {
+                for (const auto& sec : bin.pe.sections) {
+                    const std::string name(reinterpret_cast<const char*>(sec.name));
+                    if (name != ".eh_frame") continue;
+                    const uint64_t va = bin.base + sec.rva;
+                    const uint64_t sz = sec.virtual_size ? sec.virtual_size : sec.raw_size;
+                    if (sz < 16 || sz > (64ull << 20)) continue;
+                    eh_va = va;
+                    eh_size = sz;
+                    break;
+                }
+            }
+        }
+
+        std::vector<unwind::frame_t> frames;
+        std::string note;
+        bool used_cfi = false;
+        if (eh_va != 0 && eh_size != 0 && eh_size <= (64ull << 20)) {
+            struct ps4_reader_t final : unwind::reader_t {
+                runtime::session_t& s;
+                explicit ps4_reader_t(runtime::session_t& x) : s(x) {}
+                bool read(uint64_t addr, void* dst, size_t len) override {
+                    auto r = s.read(static_cast<uintptr_t>(addr), dst, len);
+                    return r.ok && r.bytes == len;
+                }
+            } rdr(*s_hold);
+            std::vector<uint8_t> eh(static_cast<size_t>(eh_size));
+            auto eio = s_hold->read(static_cast<uintptr_t>(eh_va), eh.data(), eh.size());
+            if (eio.ok && eio.bytes == eh.size()) {
+                used_cfi = unwind::elf_unwind(rdr, {eh_va, eh.data(), eh.size()},
+                                              ctx.rip, ctx.rsp, ctx.rbp, depth, frames, &note);
+            } else {
+                note = "cannot read .eh_frame at the requested address";
+            }
+        }
+        std::vector<dbg::frame_rec_t> recs;
+        if (used_cfi) {
+            recs.reserve(frames.size());
+            for (const auto& f : frames) recs.push_back({f.ret_addr, f.frame_ptr});
+        } else {
+            recs = dbg::rbp_frames(t, ctx, depth);
+        }
+        json arr = frames_json(recs);
+        json out = {{"lwpid", lwpid}, {"frames", arr}, {"count", arr.size()},
+                    {"unwinder", used_cfi ? "eh_frame" : "rbp_chain"}};
+        if (!note.empty()) out["note"] = note;
+        if (eh_va) { out["eh_frame_va"] = eh_va; out["eh_frame_size"] = eh_size; }
+        return out;
     }
     if (action == "ps4_bp_list" || action == "ps4_watch_list") {
         const bool bp = action == "ps4_bp_list";

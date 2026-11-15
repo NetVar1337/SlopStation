@@ -137,6 +137,7 @@ set(SLOP_CORE_SOURCES
     disasm/hyperion_session.cpp
     debugger/callstack.hpp
     debugger/callstack.cpp
+    debugger/eh_frame.cpp
     debugger/debug_target.hpp
     debugger/composite.hpp
     debugger/composite.cpp

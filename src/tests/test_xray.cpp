@@ -461,6 +461,75 @@ struct map_reader final : reader_t {
 
 } // namespace
 
+
+TEST_CASE(unwind_eh_frame_recovers_callers_without_frame_pointer) {
+    using slop::core::debugger::unwind::eh_frame_t;
+    using slop::core::debugger::unwind::elf_unwind;
+
+    // .eh_frame at 0x1000: one CIE (def_cfa rsp+8, RA at CFA-8, rbp at CFA-16)
+    // and one FDE covering [0x2000, 0x2100) with no extra instructions
+    std::vector<uint8_t> eh;
+    const uint8_t cie[] = {
+        0x14, 0, 0, 0,          // length 20
+        0, 0, 0, 0,             // CIE id
+        0x01,                   // version
+        'z', 'R', 0,            // augmentation
+        0x01,                   // code alignment
+        0x78,                   // data alignment -8
+        0x10,                   // return-address register 16
+        0x01,                   // augmentation length
+        0x1b,                   // FDE encoding: pcrel | sdata4
+        0x0c, 0x07, 0x08,       // DW_CFA_def_cfa rsp, 8
+        0x90, 0x01,             // DW_CFA_offset ra, 1  (CFA-8)
+        0x86, 0x02              // DW_CFA_offset rbp, 2 (CFA-16)
+    };
+    eh.insert(eh.end(), std::begin(cie), std::end(cie));
+
+    const uint64_t eh_va = 0x1000;
+    const uint64_t fde_at = eh_va + eh.size();          // 0x1018
+    const uint64_t pc_begin = 0x2000, pc_range = 0x100;
+    const uint64_t cie_ptr_field = fde_at + 4;          // 0x101c
+    const uint64_t pcbeg_field = fde_at + 8;            // 0x1020
+
+    uint8_t fde[17] = {0x0d, 0, 0, 0};                  // length 13
+    const uint32_t cie_back = static_cast<uint32_t>(cie_ptr_field - eh_va);   // 0x1c
+    std::memcpy(fde + 4, &cie_back, 4);
+    const int32_t beg = static_cast<int32_t>(pc_begin - pcbeg_field);
+    const int32_t rng = static_cast<int32_t>(pc_range);
+    std::memcpy(fde + 8, &beg, 4);
+    std::memcpy(fde + 12, &rng, 4);
+    fde[16] = 0x00;                                     // augmentation length
+    eh.insert(eh.end(), std::begin(fde), std::end(fde));
+
+    // stack: CFA = rsp+8 = 0x7008, so RA sits at 0x7000 and rbp at 0x6FF8
+    map_reader mem;
+    const uint64_t ret_addr = 0x3000, saved_rbp = 0x7200;
+    mem.put(0x7000, &ret_addr, 8);
+    mem.put(0x6FF8, &saved_rbp, 8);
+
+    std::vector<slop::core::debugger::unwind::frame_t> frames;
+    std::string note;
+    const bool ok = elf_unwind(mem, eh_frame_t{eh_va, eh.data(), eh.size()},
+                               0x2000, 0x7000, 0x7100, 8, frames, &note);
+    REQUIRE(ok);
+    REQUIRE(frames.size() == 2);
+    CHECK(frames[0].ret_addr == 0x2000);     // frame 0 is the paused pc
+    CHECK(frames[1].ret_addr == 0x3000);     // caller recovered through CFI
+    CHECK(frames[1].frame_ptr == 0x7200);
+
+    // a pc with no covering FDE reports rather than inventing a frame
+    frames.clear();
+    note.clear();
+    CHECK(!elf_unwind(mem, eh_frame_t{eh_va, eh.data(), eh.size()},
+                      0x9000, 0x7000, 0x7100, 8, frames, &note));
+    CHECK(frames.empty());
+    CHECK(!note.empty());
+
+    // truncated section must not read past the end
+    frames.clear();
+    CHECK(!elf_unwind(mem, eh_frame_t{eh_va, eh.data(), 6}, 0x2000, 0x7000, 0x7100, 8, frames));
+}
+
 TEST_CASE(unwind_walks_synthetic_rbp_chain) {
     disasm::engine_t eng;
     REQUIRE(eng.init());

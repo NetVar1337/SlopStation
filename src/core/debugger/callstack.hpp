@@ -52,6 +52,24 @@ bool pe_unwind(reader_t& rdr, const runtime::thread_context_t& ctx, size_t max_f
                const module_of_fn& module_of, std::vector<frame_t>& out,
                std::string* note = nullptr);
 
+// ---- ELF x86-64 unwind info (.eh_frame) -----------------------------------
+// PS4 eboots are ELF: there is no .pdata, and optimized builds drop the frame
+// pointer, so the rbp chain breaks. DWARF CFI describes every function's CFA
+// and return-address rule instead. The caller supplies the section bytes (from
+// the loaded image or a console dump); nothing here touches the OS.
+
+struct eh_frame_t {
+    uint64_t       va   = 0;      // VA of the .eh_frame section
+    const uint8_t* data = nullptr;
+    size_t         size = 0;
+};
+
+// Frame 0 is rip itself, then every caller resolved through .eh_frame CFI.
+// Returns false when no FDE covers rip (caller falls back to walk_stack).
+bool elf_unwind(reader_t& rdr, const eh_frame_t& eh, uint64_t rip, uint64_t rsp,
+                uint64_t rbp, size_t max_frames, std::vector<frame_t>& out,
+                std::string* note = nullptr);
+
 struct seh_entry_t {
     uint64_t handler = 0;
     uint64_t filter  = 0;
