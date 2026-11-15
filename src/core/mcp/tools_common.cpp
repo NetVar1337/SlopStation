@@ -307,9 +307,26 @@ json app_state_unlocked() {
     return out;
 }
 
+dump_progress_t& dump_progress() {
+    static dump_progress_t p;
+    return p;
+}
+
 std::optional<progress_sample_t> sample_progress(const std::string& tool,
                                                  const std::string& action,
                                                  int64_t elapsed_ms) {
+    // dump paths publish a live byte counter while they stream
+    if (action == "dump" || action == "dump_regions" || action == "dump_module" ||
+        action == "ps4_dump_module" || action == "ps5_dump_module") {
+        auto& dp = dump_progress();
+        const uint64_t total = dp.total.load(std::memory_order_relaxed);
+        if (total != 0) {
+            const uint64_t done = dp.done.load(std::memory_order_relaxed);
+            return progress_sample_t{static_cast<double>(done), static_cast<double>(total),
+                                     "dumped " + std::to_string(done) + " of " +
+                                         std::to_string(total) + " bytes"};
+        }
+    }
     // memory scans expose a live byte/hit counter
     if (tool == "memory" && (action == "scan" || action == "rescan")) {
         const auto& p = g_scan.engine.progress();
@@ -332,6 +349,9 @@ std::optional<progress_sample_t> sample_progress(const std::string& tool,
         "analyze.diff_start",   "disasm.load",               "script.run",
         "patch.full_pass",      "re.rtti_scan",              "fs.grep_in_files",
         "fs.search_files",      "network.reassemble_stream",
+        "memory.dump",           "memory.dump_regions",       "target.dump_module",
+        "target.ps4_dump_module", "target.ps5_dump_module",   "re.ue_dump",
+        "re.source_dump",        "re.il2cpp_dump",            "memory.offsets_build",
     };
     if (kLong.count(tool + "." + action) == 0) return std::nullopt;
     const double secs = static_cast<double>(elapsed_ms) / 1000.0;

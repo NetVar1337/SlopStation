@@ -221,7 +221,7 @@ size_t target_icon_cache_size() { return icon_cache().size(); }
 
 // tool: target
 
-json tool_target(const json& args) {
+json tool_target(const json& args, const infra::cancel_token_t& cancel) {
     const std::string action = require_action(args);
 
     if (action == "list") {
@@ -1036,6 +1036,9 @@ json tool_target(const json& args) {
         process::module_dump_options_t options;
         options.strict_reads = args.value("strict", true);
         options.chunk_size = 1u << 20;   // local ReadProcessMemory: fewer syscalls
+        options.cancel = cancel;
+        options.on_bytes = [](uint64_t n) { dump_progress().add(n); };
+        dump_progress().reset(selected->size);
         const std::string layout = args.value("layout", std::string("virtual"));
         if (layout != "virtual" && layout != "file")
             fail("dump_module: layout must be virtual or file");
@@ -1248,6 +1251,11 @@ json tool_target(const json& args) {
         // a console module often has pages the payload cannot read; zero-fill
         // them (complete=false) unless the caller asks for a strict dump
         options.strict_reads = args.value("strict", false);
+        options.cancel = cancel;
+        options.on_bytes = [](uint64_t n) { dump_progress().add(n); };
+        uint64_t planned = 0;
+        for (const auto& sg : segs) planned += sg.end - sg.start;
+        dump_progress().reset(planned);
         auto read = [&session](uintptr_t a, void* dst, size_t n) { return session.read(a, dst, n); };
         std::vector<uint8_t> image;
         process::elf_rebuild_info_t info;

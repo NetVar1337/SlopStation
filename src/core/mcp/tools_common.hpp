@@ -11,6 +11,8 @@
 #include "core/compat/posix_socket.hpp"
 #endif
 
+#include <atomic>
+
 #include "core/infra/app_control.hpp"
 #include "core/infra/cancel.hpp"
 #include "core/infra/clock.hpp"
@@ -193,8 +195,8 @@ json attached_target_json();
 json app_state_unlocked();   // caller holds g_tool_mu
 
 // tool handlers (one per domain)
-json tool_target(const json& args);
-json tool_memory(const json& args);
+json tool_target(const json& args, const infra::cancel_token_t& cancel = {});
+json tool_memory(const json& args, const infra::cancel_token_t& cancel = {});
 json tool_disasm(const json& args);
 json tool_debugger(const json& args);
 json tool_emulate(const json& args, infra::cancel_token_t cancel);
@@ -205,7 +207,7 @@ json tool_fs(const json& args, const infra::cancel_token_t& cancel = {});
 json tool_web(const json& args);
 json tool_decomp(const json& args);
 json tool_persist(const json& args);
-json tool_re(const json& args);
+json tool_re(const json& args, const infra::cancel_token_t& cancel = {});
 json tool_xray(const json& args);
 json tool_patch(const json& args);
 json tool_types(const json& args);
@@ -235,6 +237,18 @@ struct progress_sample_t {
 std::optional<progress_sample_t> sample_progress(const std::string& tool,
                                                  const std::string& action,
                                                  int64_t elapsed_ms);
+
+// byte counter the dump paths publish while they stream, so a long module or
+// region dump reports real progress instead of only elapsed time
+struct dump_progress_t {
+    std::atomic<uint64_t> done{0};
+    std::atomic<uint64_t> total{0};
+    void reset(uint64_t t) { done.store(0, std::memory_order_relaxed);
+                             total.store(t, std::memory_order_relaxed); }
+    void add(uint64_t n) { done.fetch_add(n, std::memory_order_relaxed); }
+    void finish() { total.store(0, std::memory_order_relaxed); }
+};
+dump_progress_t& dump_progress();
 
 // guide playbooks, shared by the guide tool, the resources and the prompts
 json guide_topics();                       // [{topic, title, summary}]

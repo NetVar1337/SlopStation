@@ -982,6 +982,11 @@ bool read_segment(const module_read_fn_t& read, uint64_t start, uint64_t end, ui
     const uint64_t total = end - start;
     const size_t nchunks = static_cast<size_t>((total + chunk - 1) / chunk);
     memory::read_ahead_t ra(read);
+    auto cancelled = [&] {
+        if (!options.cancel.cancelled()) return false;
+        result.error = "cancelled";
+        return true;
+    };
     auto issue = [&](size_t k) {
         const uint64_t a = start + k * chunk;
         ra.prefetch(static_cast<uintptr_t>(a), dst + (a - start),
@@ -989,10 +994,12 @@ bool read_segment(const module_read_fn_t& read, uint64_t start, uint64_t end, ui
     };
     issue(0);
     for (size_t k = 0; k < nchunks; ++k) {
+        if (cancelled()) return false;
         if (k + 1 < nchunks) issue(k + 1);
         const uint64_t a = start + k * chunk;
         const size_t take = static_cast<size_t>(std::min<uint64_t>(chunk, end - a));
         const auto io = ra.reap();
+        if (options.on_bytes) options.on_bytes(take);
         if (io.ok && io.bytes == take) {
             flush_warning();
             continue;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/infra/cancel.hpp"
 #include "core/runtime/backend.hpp"
 
 #include <cstddef>
@@ -23,6 +24,11 @@ enum class pe_layout_t { file, virtual_image };
 struct module_dump_options_t {
     size_t chunk_size = 64u * 1024u;
     bool strict_reads = true;
+    // cooperative stop, checked between chunks: a cancelled dump returns with
+    // error="cancelled" and no output (the caller writes the file last)
+    infra::cancel_token_t cancel;
+    // bytes streamed so far, for the MCP progress pump
+    std::function<void(uint64_t)> on_bytes;
     // PE only (reconstruct_mapped_pe / dump_module_pe)
     pe_layout_t layout = pe_layout_t::file;
     bool rebase = false;            // ImageBase := runtime base
