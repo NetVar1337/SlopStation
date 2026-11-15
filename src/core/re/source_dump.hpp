@@ -27,6 +27,9 @@ struct dump_options_t {
     std::vector<range_t> scan;            // ranges searched when locating (module data sections)
     size_t max_classes = 4096;
     bool json = true;                     // netvars.json + recvtables.json
+    bool header = true;                   // offsets.hpp (payload-SDK shape)
+    bool datamaps = false;                // also walk DataMap/TypeDescription (non-networked fields)
+    size_t max_datamaps = 4096;
 };
 
 struct dump_result_t {
@@ -34,6 +37,7 @@ struct dump_result_t {
     std::string error;
     uint64_t    head = 0;                 // located/used first ClientClass
     size_t      classes = 0, tables = 0, props = 0, netvars = 0;
+    size_t      datamaps = 0, datamap_fields = 0;
     std::vector<std::string> warnings;
     std::vector<std::pair<std::string, std::string>> files;   // file name -> contents
 };

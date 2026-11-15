@@ -115,13 +115,17 @@ live_module_t find_live_module(runtime::session_t& s, const std::string& want) {
     fail(want.empty() ? "no main module found on the target" : "module '" + want + "' is not loaded in the target");
 }
 
-std::vector<uint8_t> read_live_span(runtime::session_t& s, const live_module_t& m, std::vector<std::string>& warnings) {
+std::vector<uint8_t> read_live_span(runtime::session_t& s, const live_module_t& m,
+                                    std::vector<std::string>& warnings,
+                                    const infra::cancel_token_t& cancel = {}) {
     process::module_dump_options_t o;
     // console reads are socket round trips: one 8 MiB read instead of 32x
     // 256 KiB; failed chunks are salvaged page by page inside read_segment
     o.chunk_size = s.backend()->kind() == runtime::backend_kind_t::user_mode
                        ? (64u << 20) : memory::kRemoteChunkBytes;
     o.strict_reads = false;
+    o.cancel = cancel;
+    o.on_bytes = [](uint64_t n) { dump_progress().add(n); };
     auto read = [&s](uintptr_t a, void* dst, size_t n) { return s.read(a, dst, n); };
     std::vector<uint8_t> span;
     const auto r = process::dump_raw_span(m.segs, read, span, o);
@@ -130,7 +134,7 @@ std::vector<uint8_t> read_live_span(runtime::session_t& s, const live_module_t& 
     return span;
 }
 
-json il2cpp_dump_action(const json& args) {
+json il2cpp_dump_action(const json& args, const infra::cancel_token_t& cancel) {
     const std::string meta_path = args.value("metadata", std::string{});
     if (meta_path.empty()) fail("il2cpp_dump requires 'metadata' (path to global-metadata.dat)");
     const std::string out_dir = require_out_dir(args, "il2cpp_dump");
@@ -163,7 +167,7 @@ json il2cpp_dump_action(const json& args) {
                 is.exec = (sg.prot & 4) != 0;
                 segs.push_back(is);
             }
-        if (!il2cpp::image_from_memory(read_live_span(s, m, pre_warnings), m.base, std::move(segs), img, err))
+        if (!il2cpp::image_from_memory(read_live_span(s, m, pre_warnings, cancel), m.base, std::move(segs), img, err))
             fail("il2cpp_dump: " + err);
         source = {{"module", m.name}, {"base", m.base}, {"size", img.bytes.size()}};
     }
@@ -217,7 +221,7 @@ std::vector<ue::range_t> ue_scan_ranges(runtime::session_t& s, const live_module
     return out;
 }
 
-json ue_dump_action(const json& args) {
+json ue_dump_action(const json& args, const infra::cancel_token_t& cancel) {
     const std::string out_dir = require_out_dir(args, "ue_dump");
     const auto formats = parse_formats(args, {"json", "sdk"}, "ue_dump");
     ue::dump_options_t o;
@@ -254,9 +258,9 @@ json ue_dump_action(const json& args) {
             {"functions", r.functions}, {"scanned", scanned}, {"out_files", files}, {"warnings", r.warnings}};
 }
 
-json source_dump_action(const json& args) {
+json source_dump_action(const json& args, const infra::cancel_token_t& cancel) {
     const std::string out_dir = require_out_dir(args, "source_dump");
-    const auto formats = parse_formats(args, {"json"}, "source_dump");
+    const auto formats = parse_formats(args, {"json", "header"}, "source_dump");
     source::dump_options_t o;
     if (args.contains("head")) o.head = parse_addr(args, "head");
     if (args.contains("max_classes")) {
@@ -265,6 +269,13 @@ json source_dump_action(const json& args) {
         o.max_classes = static_cast<size_t>(mc);
     }
     o.json = formats.count("json") != 0;
+    o.header = formats.count("header") != 0;
+    o.datamaps = args.value("datamaps", false);
+    if (args.contains("max_datamaps")) {
+        const uint64_t md = parse_addr(args, "max_datamaps");
+        if (md == 0 || md > 100'000) fail("source_dump: max_datamaps must be 1..100000");
+        o.max_datamaps = static_cast<size_t>(md);
+    }
 
     const auto s_hold = need_session();
     auto& s = *s_hold;
@@ -283,20 +294,26 @@ json source_dump_action(const json& args) {
     if (!r.ok) fail("source_dump: " + r.error);
     json files = json::array();
     for (const auto& [name, body] : r.files) files.push_back(write_out(out_dir, name, body));
-    return {{"head", r.head}, {"classes", r.classes}, {"tables", r.tables}, {"props", r.props},
-            {"netvars", r.netvars}, {"scanned", scanned}, {"out_files", files}, {"warnings", r.warnings}};
+    json out = {{"head", r.head}, {"classes", r.classes}, {"tables", r.tables}, {"props", r.props},
+                {"netvars", r.netvars}, {"scanned", scanned}, {"out_files", files},
+                {"warnings", r.warnings}};
+    if (o.datamaps) {
+        out["datamaps"] = r.datamaps;
+        out["datamap_fields"] = r.datamap_fields;
+    }
+    return out;
 }
 
 } // namespace
 
 // tool: re
 
-json tool_re(const json& args) {
+json tool_re(const json& args, const infra::cancel_token_t& cancel) {
     const std::string action = require_action(args);
     // engine-metadata dumpers work on host files / the live target, not the shared image
-    if (action == "il2cpp_dump") return il2cpp_dump_action(args);
-    if (action == "ue_dump") return ue_dump_action(args);
-    if (action == "source_dump") return source_dump_action(args);
+    if (action == "il2cpp_dump") return il2cpp_dump_action(args, cancel);
+    if (action == "ue_dump") return ue_dump_action(args, cancel);
+    if (action == "source_dump") return source_dump_action(args, cancel);
 
     // app loaded binary unless a path is given
     std::optional<ds::binary_lock_t> shared_lock;

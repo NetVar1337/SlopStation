@@ -139,3 +139,51 @@ entity list or view matrix are not part of the RecvTable set — find those with
 Not covered: 32-bit Source builds, and engines that renamed `DT_` tables or moved the
 `RecvProp` fields (a wrong layout fails validation with `no ClientClass nodes`, not with
 garbage offsets).
+
+## Offsets that survive a patch
+
+Three actions turn a one-off dump into a maintained offset set.
+
+`memory.offsets_build` writes a manifest `memory.offsets_verify` accepts: each
+named address gets an anchor pattern decoded in place, grown until it matches
+exactly once inside the module's executable segment, plus that segment's
+SHA-256 as the build fingerprint.
+
+```json
+{ "tool": "memory", "action": "offsets_build",
+  "params": { "module": "eboot.bin", "out": "C:/dumps/apex/manifest.json",
+              "offsets": [ { "name": "cl_entitylist", "addr": "0x14A2B3C40" },
+                           { "name": "view_matrix", "addr": "0x14A2B0010", "aob_offset": -7 } ] } }
+```
+
+`aob_offset` shifts the anchor back from the target, for statics that are only
+reachable through the instruction that loads them. Offsets with no unique
+anchor come back in `problems[]` rather than silently producing a weak pattern.
+
+`memory.offsets_diff` compares two manifests (or two `netvars.json` dumps) and
+reports `stable` / `moved` / `missing` / `added`, with a `verdict` of
+`compatible`, `moved` or `broken`. Run it after a game update, before touching
+the console.
+
+`memory.globals` finds the static globals a function touches: every RIP-relative
+memory operand whose target lands in a module's data section. Scope it to a
+function you already know (from a string xref or an RTTI vtable slot) and read
+off what it loads — this is how `cl_entitylist` and view-matrix style statics are
+located without a signature.
+
+`re.source_dump` also writes `offsets.hpp` (one `constexpr` per netvar, grouped
+by declaring table, in the shape a payload SDK consumes) and, with
+`datamaps: true`, `datamaps.json` for the non-networked DataMap fields. The
+DataMap layout drifts between engine branches, so a candidate is accepted only
+when its own class-name string and every field record validate; nothing
+validating is a warning, not a wrong dump.
+
+## Long dumps
+
+`memory.dump`, `memory.dump_regions`, `target.dump_module`,
+`target.ps4_dump_module` and the engine dumpers' module reads are
+double-buffered: chunk k+1 streams in while chunk k is validated or written to
+disk. A failed chunk is salvaged page by page, so one unreadable page costs
+4 KiB of zero-fill instead of the whole chunk. Console dumps use 8 MiB chunks
+(one ps4debug/ps5debug command each). All of them honour the request's cancel
+token and publish a byte counter to `notifications/progress`.

@@ -799,3 +799,59 @@ TEST_CASE(source_malformed_memory_fails_cleanly) {
         CHECK(!source::dump(empty, o).ok);
     }
 }
+
+TEST_CASE(source_dump_emits_header_and_datamaps) {
+    source_fixture_t fx;
+    // a DataMap: {descs, n, className, baseMap} with 0x40-byte field records.
+    // datamaps live in the module data section, so the structs go into the
+    // scanned range (their strings may sit anywhere)
+    const uint64_t map = kSrcData + 0x1000;
+    const uint64_t descs = kSrcData + 0x2000;
+    fx.mem.w<uint64_t>(map + 0x00, descs);
+    fx.mem.w<int32_t>(map + 0x08, 2);
+    fx.mem.w<uint64_t>(map + 0x10, fx.str("CPlayerLocalData"));
+    fx.mem.w<uint64_t>(descs + 0x08, fx.str("m_nButtons"));
+    fx.mem.w<int32_t>(descs + 0x00, 3);      // FIELD_INTEGER
+    fx.mem.w<int32_t>(descs + 0x10, 0x1234);
+    fx.mem.w<int32_t>(descs + 0x18, 4);
+    fx.mem.w<uint64_t>(descs + 0x40 + 0x08, fx.str("m_vecViewOffset"));
+    fx.mem.w<int32_t>(descs + 0x40 + 0x00, 6);   // FIELD_VECTOR
+    fx.mem.w<int32_t>(descs + 0x40 + 0x10, 0x130);
+    fx.mem.w<int32_t>(descs + 0x40 + 0x18, 12);
+
+    auto o = fx.opts();
+    o.datamaps = true;
+    const auto r = source::dump(fx.mem, o);
+    REQUIRE(r.ok);
+
+    const std::string* hdr = file_of(r, "offsets.hpp");
+    REQUIRE(hdr != nullptr);
+    CHECK(has(*hdr, "namespace netvars {"));
+    CHECK(has(*hdr, "constexpr unsigned DT_Player_m_iHealth = 0x30;"));
+    CHECK(has(*hdr, "constexpr unsigned DT_Weapon_m_clip = 0x510;"));
+
+    const std::string* dm = file_of(r, "datamaps.json");
+    REQUIRE(dm != nullptr);
+    CHECK(r.datamaps >= 1u);
+    CHECK(r.datamap_fields >= 2u);
+    const auto dj = nlohmann::json::parse(*dm);
+    bool found = false;
+    for (const auto& e : dj["data"])
+        if (e["class"] == "CPlayerLocalData") {
+            found = true;
+            CHECK(e["fields"].size() == 2u);
+            CHECK(e["fields"][0]["name"] == "m_nButtons");
+            CHECK(e["fields"][0]["offset"] == 0x1234);
+            CHECK(e["fields"][1]["offset"] == 0x130);
+        }
+    CHECK(found);
+
+    // header off, datamaps off: neither file appears
+    auto o2 = fx.opts();
+    o2.header = false;
+    o2.datamaps = false;
+    const auto r2 = source::dump(fx.mem, o2);
+    REQUIRE(r2.ok);
+    CHECK(file_of(r2, "offsets.hpp") == nullptr);
+    CHECK(file_of(r2, "datamaps.json") == nullptr);
+}
