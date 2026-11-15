@@ -43,6 +43,8 @@ constexpr uint32_t kRecvTypeNames   = 8;    // DPT_Int .. DPT_Int64
 constexpr size_t   kMaxPropsPerTbl  = 512;
 constexpr size_t   kMaxTables       = 4096;
 constexpr size_t   kMaxDepth        = 32;
+// typedescription_t stride, verified against the Apex CL11700487 eboot
+constexpr uint64_t kTypeDescSize    = 0x80;
 
 // ClientClass: CreateFn 0x00, CreateEventFn 0x08, NetworkName 0x10,
 //              RecvTable 0x18, Next 0x20, ClassID 0x28
@@ -136,6 +138,25 @@ bool ident_like(const std::string& s) {   // m_foo / DT_foo / _x / 0base style
         if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '_') return false;
     return true;
 }
+
+// DataMap field names carry dots for nested members ("m_params.windDir");
+// the curated dumps render those as underscores, so accept both
+bool field_like(const std::string& s) {
+    for (char ch : s)
+        if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '_' && ch != '.') return false;
+    return true;
+}
+
+// fieldtype_t, the ids the DataMap records carry
+const char* const kFieldTypeNames[] = {
+    "void", "float", "string", "vector", "quaternion", "integer", "boolean",
+    "short", "character", "color32", "embedded", "custom", "classptr", "ehandle",
+    "edict", "position_vector", "time", "tick", "modelname", "soundname",
+    "input", "function", "vmatrix", "vmatrix_worldspace", "matrix3x4_worldspace",
+    "interval", "modelindex", "materialindex", "vector2d", "int64", "vector4d",
+};
+constexpr int32_t kFieldTypeCount =
+    static_cast<int32_t>(sizeof(kFieldTypeNames) / sizeof(kFieldTypeNames[0]));
 
 // ---------------------------------------------------------------- structures
 
@@ -306,21 +327,29 @@ public:
                 std::string cls;
                 if (!cstr(c_, c_.q(va + 0x10), cls, 48) || !ident_like(cls)) continue;
                 if (!seen.insert(va).second) continue;
-                // validate the field array before trusting the map
+                // validate the field array before trusting the map. Layout
+                // verified against the Apex CL11700487 eboot: 0x80-byte
+                // typedescription_t records, type at +0x00, name at +0x08,
+                // offset at +0x10, element count at +0x14
                 json fields = json::array();
                 bool ok = true;
                 for (int32_t i = 0; i < n && ok; ++i) {
-                    const uint64_t f = descs + static_cast<uint64_t>(i) * 0x40;
+                    const uint64_t f = descs + static_cast<uint64_t>(i) * kTypeDescSize;
                     std::string fname;
-                    if (!cstr(c_, c_.q(f + 0x08), fname, 48) || !ident_like(fname)) { ok = false; break; }
+                    if (!cstr(c_, c_.q(f + 0x08), fname, 64) || !field_like(fname)) { ok = false; break; }
                     const int32_t type = c_.i32(f + 0x00);
                     const int32_t off = c_.i32(f + 0x10);
-                    const int32_t size = c_.i32(f + 0x18);
-                    if (type < 0 || type > 32 || off < 0 || off > 0x10000 || size < 0 || size > 0x10000) {
+                    const int32_t elems = c_.i32(f + 0x14);
+                    if (type < 0 || type >= kFieldTypeCount || off < 0 || off > 0x10000 ||
+                        elems < 0 || elems > 0x1000) {
                         ok = false;
                         break;
                     }
-                    fields.push_back({{"name", fname}, {"type", type}, {"offset", off}, {"size", size}});
+                    fields.push_back({{"name", fname},
+                                      {"type", type},
+                                      {"type_name", kFieldTypeNames[type]},
+                                      {"offset", off},
+                                      {"elements", elems}});
                 }
                 if (!ok || fields.empty()) continue;
                 res_.datamap_fields += fields.size();

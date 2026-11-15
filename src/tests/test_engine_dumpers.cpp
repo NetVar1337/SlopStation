@@ -802,22 +802,29 @@ TEST_CASE(source_malformed_memory_fails_cleanly) {
 
 TEST_CASE(source_dump_emits_header_and_datamaps) {
     source_fixture_t fx;
-    // a DataMap: {descs, n, className, baseMap} with 0x40-byte field records.
-    // datamaps live in the module data section, so the structs go into the
-    // scanned range (their strings may sit anywhere)
+    // a DataMap: {descs, n, className} with 0x80-byte typedescription_t
+    // records (type +0x00, name +0x08, offset +0x10, elements +0x14), the
+    // layout verified against the Apex CL11700487 eboot. Datamaps live in the
+    // module data section, so the structs go into the scanned range (their
+    // strings may sit anywhere)
     const uint64_t map = kSrcData + 0x1000;
     const uint64_t descs = kSrcData + 0x2000;
     fx.mem.w<uint64_t>(map + 0x00, descs);
-    fx.mem.w<int32_t>(map + 0x08, 2);
+    fx.mem.w<int32_t>(map + 0x08, 3);
     fx.mem.w<uint64_t>(map + 0x10, fx.str("CPlayerLocalData"));
     fx.mem.w<uint64_t>(descs + 0x08, fx.str("m_nButtons"));
-    fx.mem.w<int32_t>(descs + 0x00, 3);      // FIELD_INTEGER
+    fx.mem.w<int32_t>(descs + 0x00, 5);          // FIELD_INTEGER
     fx.mem.w<int32_t>(descs + 0x10, 0x1234);
-    fx.mem.w<int32_t>(descs + 0x18, 4);
-    fx.mem.w<uint64_t>(descs + 0x40 + 0x08, fx.str("m_vecViewOffset"));
-    fx.mem.w<int32_t>(descs + 0x40 + 0x00, 6);   // FIELD_VECTOR
-    fx.mem.w<int32_t>(descs + 0x40 + 0x10, 0x130);
-    fx.mem.w<int32_t>(descs + 0x40 + 0x18, 12);
+    fx.mem.w<int32_t>(descs + 0x14, 1);
+    fx.mem.w<uint64_t>(descs + 0x80 + 0x08, fx.str("m_vecViewOffset"));
+    fx.mem.w<int32_t>(descs + 0x80 + 0x00, 3);   // FIELD_VECTOR
+    fx.mem.w<int32_t>(descs + 0x80 + 0x10, 0x130);
+    fx.mem.w<int32_t>(descs + 0x80 + 0x14, 1);
+    // nested members carry dots in the real records
+    fx.mem.w<uint64_t>(descs + 0x100 + 0x08, fx.str("m_params.windDir"));
+    fx.mem.w<int32_t>(descs + 0x100 + 0x00, 3);  // FIELD_VECTOR
+    fx.mem.w<int32_t>(descs + 0x100 + 0x10, 0x960);
+    fx.mem.w<int32_t>(descs + 0x100 + 0x14, 3);
 
     auto o = fx.opts();
     o.datamaps = true;
@@ -839,10 +846,14 @@ TEST_CASE(source_dump_emits_header_and_datamaps) {
     for (const auto& e : dj["data"])
         if (e["class"] == "CPlayerLocalData") {
             found = true;
-            CHECK(e["fields"].size() == 2u);
+            CHECK(e["fields"].size() == 3u);
             CHECK(e["fields"][0]["name"] == "m_nButtons");
             CHECK(e["fields"][0]["offset"] == 0x1234);
+            CHECK(e["fields"][0]["type_name"] == "integer");
             CHECK(e["fields"][1]["offset"] == 0x130);
+            CHECK(e["fields"][2]["name"] == "m_params.windDir");
+            CHECK(e["fields"][2]["offset"] == 0x960);
+            CHECK(e["fields"][2]["elements"] == 3);
         }
     CHECK(found);
 
