@@ -11,6 +11,7 @@
 #include "core/memory/dissect.hpp"
 #include "core/memory/offsets.hpp"
 #include "core/memory/read_ahead.hpp"
+#include "core/util/sha256.hpp"
 #include "core/memory/session_reader.hpp"
 
 namespace slop::core::mcp::detail {
@@ -244,7 +245,8 @@ struct span_dump_t {
 };
 
 span_dump_t stream_span(runtime::session_t& s, uint64_t addr, uint64_t len, std::ofstream& out,
-                        bool strict, size_t chunk) {
+                        bool strict, size_t chunk,
+                        const infra::cancel_token_t& cancel = {}) {
     constexpr size_t kPage = 0x1000;
     span_dump_t r;
     // double-buffered: chunk k+1 streams in while chunk k is retried/written
@@ -254,6 +256,7 @@ span_dump_t stream_span(runtime::session_t& s, uint64_t addr, uint64_t len, std:
     memory::read_ahead_t ra([&s](uintptr_t a, void* d, size_t n) { return s.read(a, d, n); });
     size_t slot = 0;
     for (uint64_t off = 0; off < len; slot = 1 - slot) {
+        if (cancel.cancelled()) { r.error = "cancelled"; return r; }
         const size_t n = static_cast<size_t>(std::min<uint64_t>(chunk, len - off));
         const uint64_t at = addr + off;
         uint8_t* cur = buf[slot].data();
@@ -287,6 +290,7 @@ span_dump_t stream_span(runtime::session_t& s, uint64_t addr, uint64_t len, std:
             return r;
         }
         r.written += n;
+        dump_progress().add(n);
         off += n;
     }
     return r;
@@ -311,7 +315,7 @@ bool commit_file(const std::filesystem::path& tmp, const std::filesystem::path& 
 
 // tool: memory
 
-json tool_memory(const json& args) {
+json tool_memory(const json& args, const infra::cancel_token_t& cancel) {
     const std::string action = require_action(args);
     // say unknown action before no target attached, a typo isnt a missing target
     {
@@ -323,7 +327,7 @@ json tool_memory(const json& args) {
             "live_crypto", "watch_list", "watch_add", "watch_remove",
             "watch_clear", "watch_set", "watch_undo", "watch_freeze_once",
             "watch_export_ct", "watch_import_ct", "watch_history",
-            "offsets_verify", "dissect", "dump", "dump_regions",
+            "offsets_verify", "offsets_build", "offsets_diff", "globals", "dissect", "dump", "dump_regions",
         };
         const bool known = std::any_of(std::begin(kKnown), std::end(kKnown),
                                         [&](const char* k) { return action == k; });
@@ -671,6 +675,139 @@ json tool_memory(const json& args) {
     const auto s_hold = need_session();
     auto& s = *s_hold;
 
+    // build a manifest for offsets_verify: decode at each anchor, wildcard the
+    // relocatable bytes, grow until the pattern is unique inside the module's
+    // executable segment (the same scope verify_offsets checks)
+    if (action == "offsets_build") {
+        if (!args.contains("offsets") || !args.at("offsets").is_array() ||
+            args.at("offsets").empty())
+            fail("offsets_build requires 'offsets' (array of {name, addr, aob_offset?})");
+        const std::string mod = opt_str(args, "module", "eboot.bin");
+        auto mods = s.backend()->enum_modules(s.handle());
+        if (!mods.ok) fail("module enumeration failed: " + runtime::ps4::io_error_str(mods.error));
+        const auto m = std::find_if(mods.items.begin(), mods.items.end(),
+                                    [&](const auto& x) { return _stricmp(x.name.c_str(), mod.c_str()) == 0; });
+        if (m == mods.items.end()) fail("offsets_build: module '" + mod + "' is not loaded");
+        constexpr uint32_t kExec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                   PAGE_EXECUTE_WRITECOPY;
+        memory::scan_region_t text{};
+        for (const auto& r : runtime::target_scan_regions(s.handle()))
+            if ((r.protect & kExec) && r.base >= m->base && r.base < m->base + m->size &&
+                (text.size == 0 || r.base < text.base))
+                text = r;
+        if (text.size == 0) fail("offsets_build: no executable segment in " + mod);
+        if (text.size > (512ull << 20)) fail("offsets_build: executable segment over 512 MiB");
+        std::vector<uint8_t> bytes(text.size);
+        auto io = s.read(text.base, bytes.data(), bytes.size());
+        if (!io.ok || io.bytes != bytes.size())
+            fail("offsets_build: cannot read the executable segment at " + addr_hex_str(text.base));
+
+        auto& eng = shared_engine();
+        if (!eng.ok() && !eng.init()) fail("zydis engine init failed");
+
+        json entries = json::array();
+        json problems = json::array();
+        const size_t max_len = std::min<size_t>(opt_u64(args, "max_length", 128), 256);
+        for (const auto& e : args.at("offsets")) {
+            const std::string name = e.is_object() ? e.value("name", std::string{}) : "";
+            if (name.empty()) { problems.push_back("entry without a name skipped"); continue; }
+            uint64_t target = 0;
+            if (e.contains("addr")) {
+                const auto& a = e["addr"];
+                if (a.is_number_unsigned()) target = a.get<uint64_t>();
+                else if (a.is_number_integer() && a.get<int64_t>() >= 0) target = static_cast<uint64_t>(a.get<int64_t>());
+                else if (a.is_string()) {
+                    try { target = std::stoull(a.get<std::string>(), nullptr, 0); } catch (...) { target = 0; }
+                }
+            }
+            if (target == 0) { problems.push_back(name + ": missing or bad addr"); continue; }
+            int64_t delta = 0;
+            if (e.contains("aob_offset") && e["aob_offset"].is_number_integer())
+                delta = e["aob_offset"].get<int64_t>();
+            const uint64_t anchor = static_cast<uint64_t>(static_cast<int64_t>(target) - delta);
+            if (anchor < text.base || anchor >= text.base + text.size) {
+                problems.push_back(name + ": anchor " + addr_hex_str(anchor) +
+                                   " is outside the executable segment");
+                continue;
+            }
+
+            // grow the pattern until it matches exactly once in the segment
+            std::string pat, mask;
+            bool unique = false;
+            for (size_t want = 24; want <= max_len && !unique; want += 8) {
+                const size_t off = static_cast<size_t>(anchor - text.base);
+                const size_t avail = std::min(want, text.size - off);
+                pat.clear();
+                mask.clear();
+                size_t cur = 0;
+                while (cur < avail) {
+                    auto in = eng.decode(anchor + cur, bytes.data() + off + cur, avail - cur);
+                    if (!in || in->length == 0) break;
+                    for (size_t b = 0; b < static_cast<size_t>(in->length); ++b) {
+                        const bool is_branch = in->flow != disasm::flow_t::none &&
+                                               in->flow != disasm::flow_t::ret;
+                        bool wild = false;
+                        if (in->has_rip_rel && in->length >= 6 &&
+                            b >= static_cast<size_t>(in->length - 4) && !is_branch)
+                            wild = true;
+                        else if (is_branch && in->length == 5 && b >= 1)
+                            wild = true;
+                        else if (is_branch && in->length == 6 && in->bytes[0] == 0x0F && b >= 2)
+                            wild = true;
+                        char hex[4];
+                        std::snprintf(hex, sizeof(hex), "%02X ", bytes[off + cur + b]);
+                        if (!wild) { pat += hex; mask += 'x'; }
+                        else       { pat += "?? "; mask += '?'; }
+                    }
+                    cur += in->length;
+                }
+                while (!pat.empty() && pat.back() == ' ') pat.pop_back();
+                if (pat.empty()) break;
+                std::string cerr;
+                auto p = memory::aob_compile(pat, cerr);
+                if (!p) break;
+                size_t hits = 0;
+                for (size_t i = 0; i + p->size() <= bytes.size() && hits < 2; ++i)
+                    if (memory::aob_match(*p, bytes.data() + i, bytes.size() - i)) ++hits;
+                unique = hits == 1;
+            }
+            if (!unique) {
+                problems.push_back(name + ": no unique anchor at " + addr_hex_str(anchor) +
+                                   " within " + std::to_string(max_len) + " bytes");
+                continue;
+            }
+            json ent = {{"name", name}, {"rva", anchor - text.base}, {"aob", pat},
+                        {"aob_offset", delta}};
+            if (e.contains("note") && e["note"].is_string()) ent["note"] = e["note"];
+            entries.push_back(std::move(ent));
+        }
+
+        json manifest = {{"module", mod},
+                         {"text_sha256", util::sha256_hex(bytes.data(), bytes.size())},
+                         {"offsets", entries}};
+        if (auto* p4 = runtime::registry_ps4_active()
+                ? dynamic_cast<runtime::backend_ps4_t*>(&runtime::active()) : nullptr) {
+            runtime::backend_ps4_t::ps4_app_info_t app;
+            if (p4->ps4_foreground_app(app).ok) {
+                if (!app.titleid.empty()) manifest["title_id"] = app.titleid;
+                if (!app.app_ver.empty()) manifest["app_ver"] = app.app_ver;
+            }
+        }
+        json out = {{"module", m->name},
+                    {"text", {{"base", text.base}, {"size", text.size}}},
+                    {"text_sha256", manifest["text_sha256"]},
+                    {"offsets", entries.size()},
+                    {"problems", problems}};
+        const std::string out_path = opt_str(args, "out", "");
+        if (!out_path.empty()) {
+            if (!infra::paths::write_file_atomic(out_path, manifest.dump(2)))
+                fail("offsets_build: cannot write " + out_path);
+            out["path"] = out_path;
+        }
+        out["manifest"] = manifest;
+        return out;
+    }
+
     // fingerprint-gated offset manifest (core/memory/offsets.hpp): pinned
     // build + unique anchors, or no addresses at all
     if (action == "offsets_verify") {
@@ -723,6 +860,76 @@ json tool_memory(const json& args) {
         out["module"] = {{"name", m->name}, {"base", static_cast<uint64_t>(m->base)}};
         out["text"] = {{"base", static_cast<uint64_t>(text.base)}, {"size", text.size}};
         return out;
+    }
+
+    // compare two offset sets across builds: which values survived a patch,
+    // which moved, and which the new build no longer has. Reads only the two
+    // files, so it answers "what broke" before touching the console
+    if (action == "offsets_diff") {
+        auto load = [&](const char* key) {
+            const std::string p = opt_str(args, key, "");
+            if (p.empty()) fail(std::string("offsets_diff requires '") + key + "' (path to a manifest or netvars.json)");
+            std::ifstream f(p, std::ios::binary);
+            if (!f) fail(std::string("offsets_diff: cannot open ") + p);
+            auto j = json::parse(f, nullptr, false);
+            if (j.is_discarded()) fail(std::string("offsets_diff: ") + p + " is not valid JSON");
+            return j;
+        };
+        const json a = load("old");
+        const json b = load("new");
+
+        // one flat name -> value map out of either format
+        auto flatten = [](const json& j) {
+            std::map<std::string, int64_t> m;
+            if (j.is_object() && j.contains("netvars") && j["netvars"].is_object()) {
+                for (auto it = j["netvars"].begin(); it != j["netvars"].end(); ++it)
+                    if (it.value().is_number_integer()) m[it.key()] = it.value().get<int64_t>();
+                return m;
+            }
+            if (j.is_object() && j.contains("offsets") && j["offsets"].is_array()) {
+                for (const auto& e : j["offsets"]) {
+                    if (!e.is_object()) continue;
+                    const std::string name = e.value("name", std::string{});
+                    if (name.empty()) continue;
+                    if (e.contains("rva")) {
+                        const auto& r = e["rva"];
+                        if (r.is_number_integer()) m[name] = r.get<int64_t>();
+                        else if (r.is_number_unsigned()) m[name] = static_cast<int64_t>(r.get<uint64_t>());
+                        else if (r.is_string()) {
+                            try { m[name] = static_cast<int64_t>(std::stoull(r.get<std::string>(), nullptr, 0)); }
+                            catch (...) {}
+                        }
+                    } else if (e.contains("addr") && e["addr"].is_number_integer()) {
+                        m[name] = e["addr"].get<int64_t>();
+                    }
+                }
+                return m;
+            }
+            fail("offsets_diff: a file is neither a manifest {offsets:[...]} nor a netvar dump {netvars:{...}}");
+            return std::map<std::string, int64_t>{};
+        };
+        const auto ma = flatten(a);
+        const auto mb = flatten(b);
+
+        json stable = json::array(), moved = json::array(), gone = json::array(), added = json::array();
+        for (const auto& [name, old_v] : ma) {
+            const auto it = mb.find(name);
+            if (it == mb.end()) { gone.push_back(name); continue; }
+            if (it->second == old_v) stable.push_back(name);
+            else moved.push_back({{"name", name}, {"old", old_v}, {"new", it->second},
+                                  {"delta", it->second - old_v}});
+        }
+        for (const auto& [name, _] : mb)
+            if (!ma.count(name)) added.push_back(name);
+
+        return {{"old", {{"entries", ma.size()}}},
+                {"new", {{"entries", mb.size()}}},
+                {"stable", stable}, {"stable_count", stable.size()},
+                {"moved", moved}, {"moved_count", moved.size()},
+                {"missing", gone}, {"missing_count", gone.size()},
+                {"added", added}, {"added_count", added.size()},
+                {"verdict", moved.empty() && gone.empty() ? "compatible"
+                            : (gone.empty() ? "moved" : "broken")}};
     }
 
     // guess the layout of an unknown object, one row per 8-byte slot
@@ -861,11 +1068,12 @@ json tool_memory(const json& args) {
             if (dst.has_parent_path()) fs::create_directories(dst.parent_path(), ec);
             fs::path tmp = dst;
             tmp += ".part";
+            dump_progress().reset(len);
             span_dump_t r;
             {
                 std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
                 if (!f) fail("memory.dump: cannot create " + tmp.string());
-                r = stream_span(s, addr, len, f, strict, chunk);
+                r = stream_span(s, addr, len, f, strict, chunk, cancel);
                 f.close();
                 if (r.error.empty() && !f) r.error = "file write failed";
             }
@@ -877,6 +1085,7 @@ json tool_memory(const json& args) {
                 fail("memory.dump: " + r.error);
             }
             if (!commit_file(tmp, dst)) fail("memory.dump: cannot replace " + path);
+            dump_progress().finish();
             return {{"path", path}, {"addr", addr}, {"addr_hex", addr_hex_str(addr)},
                     {"len", len}, {"bytes_written", r.written},
                     {"unreadable_bytes", r.unreadable}, {"complete", r.unreadable == 0}};
@@ -901,6 +1110,16 @@ json tool_memory(const json& args) {
                                     PAGE_EXECUTE_WRITECOPY;
         constexpr uint32_t kExec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
                                    PAGE_EXECUTE_WRITECOPY;
+        // a total up front so the progress pump can report a real fraction
+        uint64_t planned = 0;
+        for (const auto& r : regions) {
+            if (r.protect == 0 || (r.protect & PAGE_NOACCESS)) continue;
+            if (writable_only && !(r.protect & kWrite)) continue;
+            if (exec_only && !(r.protect & kExec)) continue;
+            if (planned + r.size > max_total) continue;
+            planned += r.size;
+        }
+        dump_progress().reset(planned);
         json index = json::array();
         uint64_t total = 0, unreadable = 0;
         size_t over_budget = 0, vanished = 0;
@@ -921,7 +1140,7 @@ json tool_memory(const json& args) {
             {
                 std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
                 if (!f) fail("memory.dump_regions: cannot create " + tmp.string());
-                sd = stream_span(s, r.base, r.size, f, false, chunk);
+                sd = stream_span(s, r.base, r.size, f, false, chunk, cancel);
                 f.close();
                 if (sd.error.empty() && !f) sd.error = "file write failed";
             }
@@ -951,6 +1170,7 @@ json tool_memory(const json& args) {
         const fs::path index_path = dir / "index.json";
         if (!infra::paths::write_file_atomic(index_path.string(), index.dump(2)))
             fail("memory.dump_regions: cannot write " + index_path.string());
+        dump_progress().finish();
         return {{"dir", dir_s}, {"regions", index.size()}, {"bytes_written", total},
                 {"unreadable_bytes", unreadable}, {"index_path", index_path.string()},
                 {"skipped_over_budget", over_budget}, {"skipped_unreadable", vanished},
@@ -1702,6 +1922,88 @@ json tool_memory(const json& args) {
             else if (fmt == "yara")   out["signature"] = out["yara"];
         }
         return out;
+    }
+
+    // find the static globals a function touches: every RIP-relative memory
+    // operand whose target lands in a module's data section is a global. This
+    // is how cl_entitylist / view-matrix style statics are located without a
+    // signature: start from a function you already know (xref on a string, an
+    // RTTI vtable slot) and read off what it loads
+    if (action == "globals") {
+        const std::string mod = opt_str(args, "module", "eboot.bin");
+        auto mods = s.backend()->enum_modules(s.handle());
+        if (!mods.ok) fail("module enumeration failed: " + runtime::ps4::io_error_str(mods.error));
+        const auto m = std::find_if(mods.items.begin(), mods.items.end(),
+                                    [&](const auto& x) { return _stricmp(x.name.c_str(), mod.c_str()) == 0; });
+        if (m == mods.items.end()) fail("globals: module '" + mod + "' is not loaded");
+
+        constexpr uint32_t kExec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                   PAGE_EXECUTE_WRITECOPY;
+        // [begin, end) defaults to the whole module; scope it to one function
+        uint64_t begin = args.contains("begin") ? parse_addr(args, "begin") : m->base;
+        uint64_t end   = args.contains("end")   ? parse_addr(args, "end")   : m->base + m->size;
+        if (end <= begin) fail("globals: end must be greater than begin");
+        if (end - begin > (64ull << 20)) fail("globals: range capped at 64 MiB; scope it to a function");
+
+        // data sections of every loaded module: a rip-relative target inside
+        // one of these is a global, not a jump table or a heap pointer
+        struct data_range_t { uint64_t lo, hi, mod_base; std::string module; };
+        std::vector<data_range_t> data;
+        for (const auto& mm : mods.items)
+            for (const auto& r : runtime::target_scan_regions(s.handle()))
+                if (r.base >= mm.base && r.base < mm.base + mm.size && !(r.protect & kExec) &&
+                    r.protect != 0 && !(r.protect & PAGE_NOACCESS))
+                    data.push_back({r.base, r.base + r.size, mm.base, mm.name});
+        if (data.empty()) fail("globals: no readable data sections in the target's modules");
+
+        std::vector<uint8_t> code(static_cast<size_t>(end - begin));
+        auto io = s.read(static_cast<uintptr_t>(begin), code.data(), code.size());
+        if (!io.ok || io.bytes != code.size())
+            fail("globals: cannot read " + addr_hex_str(begin) + " (" +
+                 std::to_string(code.size()) + " bytes)");
+
+        auto& eng = shared_engine();
+        if (!eng.ok() && !eng.init()) fail("zydis engine init failed");
+
+        const size_t want = std::min<size_t>(opt_u64(args, "limit", 500), 5000);
+        json hits = json::array();
+        size_t scanned = 0, insns = 0;
+        for (size_t off = 0; off < code.size();) {
+            auto in = eng.decode(begin + off, code.data() + off, code.size() - off);
+            if (!in || in->length == 0) { ++off; continue; }
+            ++insns;
+            if (in->has_rip_rel) {
+                const uint64_t t = in->rip_rel_target;
+                for (const auto& d : data) {
+                    if (t < d.lo || t >= d.hi) continue;
+                    hits.push_back({{"insn", begin + off}, {"insn_hex", addr_hex_str(begin + off)},
+                                    {"text", in->text}, {"target", t},
+                                    {"target_hex", addr_hex_str(t)},
+                                    {"target_module", d.module},
+                                    {"target_rva", t - d.mod_base}});
+                    break;
+                }
+                if (hits.size() >= want) break;
+            }
+            off += in->length;
+        }
+        scanned = code.size();
+
+        // group by target so a global loaded by several instructions shows once
+        std::map<uint64_t, size_t> by_target;
+        for (size_t i = 0; i < hits.size(); ++i)
+            by_target[hits[i]["target"].get<uint64_t>()] = i;
+        json uniq = json::array();
+        for (const auto& [t, i] : by_target) uniq.push_back(hits[i]);
+
+        return {{"module", m->name},
+                {"range", {{"begin", begin}, {"begin_hex", addr_hex_str(begin)},
+                           {"end", end}, {"size", scanned}}},
+                {"instructions", insns},
+                {"globals", uniq},
+                {"count", uniq.size()},
+                {"references", hits.size()},
+                {"truncated", hits.size() >= want}};
     }
 
     if (action == "live_crypto") {
