@@ -530,6 +530,70 @@ TEST_CASE(unwind_eh_frame_recovers_callers_without_frame_pointer) {
     CHECK(!elf_unwind(mem, eh_frame_t{eh_va, eh.data(), 6}, 0x2000, 0x7000, 0x7100, 8, frames));
 }
 
+TEST_CASE(unwind_eh_frame_evaluates_dwarf_expressions) {
+    using slop::core::debugger::unwind::eh_frame_t;
+    using slop::core::debugger::unwind::elf_unwind;
+
+    // Same CIE/FDE shape as the offset test, but the CFA and the return
+    // address come from DWARF expressions instead of plain offsets:
+    //   def_cfa_expression  DW_OP_breg7 0x10        (rsp + 0x10)
+    //   expression ra       DW_OP_breg7 -0x8        (value at rsp - 8)
+    std::vector<uint8_t> eh;
+    const uint8_t cie[] = {
+        0x16, 0, 0, 0,          // length 22
+        0, 0, 0, 0,             // CIE id
+        0x01,                   // version
+        'z', 'R', 0,            // augmentation
+        0x01,                   // code alignment
+        0x78,                   // data alignment -8
+        0x10,                   // return-address register 16
+        0x01,                   // augmentation length
+        0x1b,                   // FDE encoding: pcrel | sdata4
+        0x0f, 0x02, 0x77, 0x10, // DW_CFA_def_cfa_expression len=2 breg7 +0x10
+        0x10, 0x10, 0x02, 0x77, 0x78,  // DW_CFA_expression ra, len=2 breg7 -8
+    };
+    eh.insert(eh.end(), std::begin(cie), std::end(cie));
+
+    const uint64_t eh_va = 0x1000;
+    const uint64_t fde_at = eh_va + eh.size();
+    const uint64_t pc_begin = 0x2000, pc_range = 0x100;
+    const uint64_t cie_ptr_field = fde_at + 4;
+    const uint64_t pcbeg_field = fde_at + 8;
+
+    uint8_t fde[17] = {0x0d, 0, 0, 0};
+    const uint32_t cie_back = static_cast<uint32_t>(cie_ptr_field - eh_va);
+    std::memcpy(fde + 4, &cie_back, 4);
+    const int32_t beg = static_cast<int32_t>(pc_begin - pcbeg_field);
+    const int32_t rng = static_cast<int32_t>(pc_range);
+    std::memcpy(fde + 8, &beg, 4);
+    std::memcpy(fde + 12, &rng, 4);
+    fde[16] = 0x00;
+    eh.insert(eh.end(), std::begin(fde), std::end(fde));
+
+    // rsp = 0x7000 -> CFA = 0x7010, return address slot = rsp - 8 = 0x6FF8
+    map_reader mem;
+    const uint64_t ret_addr = 0x3000;
+    mem.put(0x6FF8, &ret_addr, 8);
+
+    std::vector<slop::core::debugger::unwind::frame_t> frames;
+    std::string note;
+    const bool ok = elf_unwind(mem, eh_frame_t{eh_va, eh.data(), eh.size()},
+                               0x2000, 0x7000, 0x7100, 8, frames, &note);
+    REQUIRE(ok);
+    REQUIRE(frames.size() == 2);
+    CHECK(frames[0].ret_addr == 0x2000);
+    CHECK(frames[1].ret_addr == 0x3000);
+
+    // an expression that reads a register with no known value must fail closed
+    std::vector<uint8_t> bad(eh);
+    // def_cfa_expression breg1 (rcx) instead of breg7: byte 19 is the breg op
+    bad[19] = 0x71;
+    frames.clear();
+    note.clear();
+    CHECK(!elf_unwind(mem, eh_frame_t{eh_va, bad.data(), bad.size()},
+                      0x2000, 0x7000, 0x7100, 8, frames, &note));
+    CHECK(!note.empty());
+}
 TEST_CASE(unwind_walks_synthetic_rbp_chain) {
     disasm::engine_t eng;
     REQUIRE(eng.init());
