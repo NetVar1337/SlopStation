@@ -222,6 +222,9 @@ std::vector<ue::range_t> ue_scan_ranges(runtime::session_t& s, const live_module
 }
 
 json ue_dump_action(const json& args, const infra::cancel_token_t& cancel) {
+    // the module read (read_live_span) honours the token; the metadata walk
+    // below does not, so a cancel cannot interrupt it mid-walk
+    (void)cancel;
     const std::string out_dir = require_out_dir(args, "ue_dump");
     const auto formats = parse_formats(args, {"json", "sdk"}, "ue_dump");
     ue::dump_options_t o;
@@ -259,6 +262,9 @@ json ue_dump_action(const json& args, const infra::cancel_token_t& cancel) {
 }
 
 json source_dump_action(const json& args, const infra::cancel_token_t& cancel) {
+    // the module read honours the token; the ClientClass/RecvTable walk does
+    // not, so a cancel cannot interrupt it mid-walk
+    (void)cancel;
     const std::string out_dir = require_out_dir(args, "source_dump");
     const auto formats = parse_formats(args, {"json", "header"}, "source_dump");
     source::dump_options_t o;

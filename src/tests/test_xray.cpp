@@ -118,7 +118,7 @@ TEST_CASE(xray_pages_classification) {
 
     // page classification over the entry area keeps this honest without
     // leaning on any one toolchains quirks
-    auto pages = xray::classify_pages(r, fx.base + fx.pe.entry_rva & ~0xFFFull,
+    auto pages = xray::classify_pages(r, (fx.base + fx.pe.entry_rva) & ~0xFFFull,
                                       8192, 4096);
     REQUIRE_GE(pages.size(), 2u);
     bool any_label = false;

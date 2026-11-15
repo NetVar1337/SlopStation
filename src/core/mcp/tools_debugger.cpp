@@ -10,6 +10,10 @@
 #include "core/memory/console_scan.hpp"
 #include "core/runtime/broker.hpp"
 
+#include <chrono>
+#include <set>
+#include <thread>
+
 namespace slop::core::mcp::detail {
 
 namespace {
