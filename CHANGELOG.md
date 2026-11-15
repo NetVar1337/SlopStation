@@ -7,6 +7,28 @@ section matching the pushed tag as the GitHub release notes.
 
 ## [Unreleased]
 
+### Added
+
+- `re.source_dump`: Source engine (Titanfall-derived, e.g. Apex Legends PS4) netvar dumper
+  over the live target. Locates the ClientClass linked list by structural validation in
+  the module's writable sections (or takes an explicit `head`), walks every
+  RecvTable/RecvProp and writes `netvars.json` (flat hazedumper-style
+  `DT_Table->m_prop -> offset` map) plus `recvtables.json` (raw per-class prop layout).
+  Runs through the MCP `re` tool, the guide playbook (`source_dump`) and the docs
+  (`docs/features/engine-dumpers.md`).
+
+### Changed
+
+- Live dumps are double-buffered and use console-sized chunks. `read_segment`
+  (backing `target.ps4_dump_module`, `target.ps5_dump_module`, `target.dump_module`
+  and the engine dumpers' module reads) streams chunk k+1 in while chunk k is
+  validated, and a failed chunk is now salvaged page by page: one unreadable
+  page costs 4 KiB of zero-fill instead of the whole chunk. Console dumps use
+  8 MiB chunks (one ps4debug/ps5debug command each) instead of 256 KiB, cutting
+  a large module dump from hundreds of serialized socket round trips to tens.
+  `memory.dump` / `memory.dump_regions` overlap the next wire read with the
+  current file write. Local dumps use 1 MiB / 64 MiB chunks.
+
 ## [0.4.1] - 2026-11-14
 
 ### Fixed

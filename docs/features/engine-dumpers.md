@@ -95,3 +95,47 @@ going and names that guess in `warnings`. If auto-locate fails, pass `gnames`/`g
 
 Not covered: 32-bit targets, `UE_FNAME_OUTLINE_NUMBER` builds (4-byte `FName`), and
 engines with custom object layouts that move `ClassPrivate`/`NamePrivate`.
+
+## Source engine (Titanfall-derived, e.g. Apex Legends): `re.source_dump`
+
+```json
+{ "tool": "re", "action": "source_dump", "params": { "out_dir": "C:/dumps/apex" } }
+{ "tool": "re", "action": "source_dump",
+  "params": { "head": "0x14A2B3C40", "out_dir": "C:/dumps/apex" } }
+```
+
+| Parameter | Meaning |
+| --- | --- |
+| `head` | Optional. The first `ClientClass*` of the game's class list (the `GetAllClasses` root). Skips the search. |
+| `module` | Optional. The module whose writable sections are searched. Default: the main module (`eboot.bin` on a PS4). |
+| `max_classes` | Cap on the ClientClass chain walk. Default 4096. |
+| `format` | `json` (default). |
+
+Attach to the game process first (`target.ps4_connect` + `target.attach`, or
+`target.ps4_auto`). Apex Legends on PS4 is a 64-bit Titanfall-derived Source build, so the
+stock Source SDK x64 `ClientClass`/`RecvTable`/`RecvProp` layouts apply and every table is
+found by structure, not by game-specific signatures.
+
+Outputs:
+
+- `netvars.json`: flat `DT_Table->m_prop` → offset map (hazedumper layout) plus the
+  located `head`. A `DPT_DataTable` prop contributes its own offset to its children; a
+  `"0"`-prefixed baseclass prop contributes nothing. First table to define a name wins.
+- `recvtables.json`: per-class entries (`class`, `table`, `class_id`, `recv_table`) with
+  the raw `RecvProp` layout (name, type, offset, elements, stride, nested `data_table`).
+
+How the list is located: every qword in the module's writable sections is checked as a
+`ClientClass` candidate (printable `m_pNetworkName`, `m_pNext` null or aligned, and a
+`m_pRecvTable` whose `DT_`-prefixed name, prop count and prop varnames validate). Nodes
+nobody points at are chain heads; the longest validating chain wins. A chain shorter than
+5 classes comes with a warning — the located node was probably mid-list, so pass the true
+`head` (from xrefs on the engine's `GetAllClasses`, or the first run's return value).
+
+Reads go through the same page cache as `ue_dump` (64 KiB pages on a console). Netvars
+are the networked player/entity state (what PC offset sites list); statics like the
+entity list or view matrix are not part of the RecvTable set — find those with
+`memory.aob`/`debugger.ps4_xrefs_to` against the dumped module.
+
+Not covered: 32-bit Source builds, and engines that renamed `DT_` tables or moved the
+`RecvProp` fields (a wrong layout fails validation with `no ClientClass nodes`, not with
+garbage offsets).

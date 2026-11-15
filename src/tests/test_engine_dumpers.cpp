@@ -7,6 +7,7 @@
 
 #include "core/memory/reader.hpp"
 #include "core/re/il2cpp_dump.hpp"
+#include "core/re/source_dump.hpp"
 #include "core/re/ue_dump.hpp"
 
 #include <nlohmann/json.hpp>
@@ -17,6 +18,7 @@
 #include <vector>
 
 namespace il2cpp = slop::core::re::il2cpp;
+namespace source = slop::core::re::source;
 namespace ue = slop::core::re::ue;
 
 namespace {
@@ -532,6 +534,12 @@ const std::string* file_of(const ue::dump_result_t& r, const char* name) {
     return nullptr;
 }
 
+const std::string* file_of(const source::dump_result_t& r, const char* name) {
+    for (const auto& [n, body] : r.files)
+        if (n == name) return &body;
+    return nullptr;
+}
+
 } // namespace
 
 TEST_CASE(ue_auto_locate_and_walk_ue5_layout) {
@@ -634,5 +642,160 @@ TEST_CASE(ue_malformed_memory_fails_cleanly) {
         const std::string* sdk = file_of(r, "SDK.hpp");
         REQUIRE(sdk != nullptr);
         CHECK(has(*sdk, "struct FVector {"));
+    }
+}
+
+// ------------------------------------------------------------ source fixture
+// Source engine (Apex Legends style): ClientClass nodes live in the module
+// data section, RecvTables/RecvProps/strings in the heap. Prop structs are
+// inline arrays (RecvTable.m_pProps points at n contiguous 0x58-byte RecvProp)
+
+constexpr uint64_t kSrcData = 0x500000000ull, kSrcHeap = 0x600000000ull;
+
+struct source_fixture_t {
+    fake_mem_t mem;
+    uint64_t heap_next = kSrcHeap + 0x100;
+
+    uint64_t alloc(size_t n) {
+        const uint64_t a = heap_next;
+        heap_next += (n + 15) & ~size_t{15};
+        return a;
+    }
+    uint64_t str(const std::string& s) {
+        const uint64_t a = alloc(s.size() + 1);
+        std::memcpy(mem.regions[kSrcHeap].data() + (a - kSrcHeap), s.data(), s.size() + 1);
+        return a;
+    }
+    // returns the RecvTable address; *props_out (when given) receives the
+    // inline RecvProp array address so tests can poke per-prop fields
+    uint64_t table(const std::string& dt_name, const std::vector<std::pair<std::string, uint32_t>>& defs,
+                   const std::vector<uint64_t>& extra_dt = {}, const std::vector<int32_t>& extra_off = {},
+                   uint64_t* props_out = nullptr) {
+        const uint64_t t = alloc(0x28);
+        mem.w<uint64_t>(t + 0x18, str(dt_name));
+        mem.w<int32_t>(t + 0x08, static_cast<int32_t>(defs.size()));
+        const uint64_t props = alloc(defs.size() * 0x58);
+        mem.w<uint64_t>(t + 0x00, props);
+        if (props_out) *props_out = props;
+        for (size_t i = 0; i < defs.size(); ++i) {
+            const uint64_t p = props + i * 0x58;
+            mem.w<uint64_t>(p + 0x00, str(defs[i].first));
+            mem.w<uint32_t>(p + 0x08, defs[i].second);
+            mem.w<int32_t>(p + 0x40, 0);
+        }
+        for (size_t i = 0; i < extra_dt.size(); ++i) {
+            const uint64_t p = props + i * 0x58;
+            mem.w<uint64_t>(p + 0x38, extra_dt[i]);
+            mem.w<int32_t>(p + 0x40, extra_off[i]);
+        }
+        return t;
+    }
+    uint64_t klass(const std::string& net_name, uint64_t tbl, uint64_t next, int32_t id) {
+        const uint64_t cc = alloc(0x30);
+        mem.w<uint64_t>(cc + 0x10, str(net_name));
+        mem.w<uint64_t>(cc + 0x18, tbl);
+        mem.w<uint64_t>(cc + 0x20, next);
+        mem.w<int32_t>(cc + 0x28, id);
+        return cc;
+    }
+
+    uint64_t world_cc = 0, base_cc = 0, player_cc = 0, head_slot = kSrcData + 0x20;
+
+    source_fixture_t() {
+        mem.region(kSrcData, 0x10000);
+        mem.region(kSrcHeap, 0x100000);
+
+        uint64_t props_base = 0, props_player = 0, props_weapon = 0;
+        const uint64_t dt_weapon = table("DT_Weapon", {{"m_clip", 0}}, {}, {}, &props_weapon);
+        const uint64_t dt_base = table("DT_BaseEntity", {{"m_vecOrigin", 2}, {"m_iTeamNum", 0}}, {}, {}, &props_base);
+        const uint64_t dt_player = table("DT_Player", {{"0", 6}, {"m_iHealth", 0}, {"m_hWeapons", 5}, {"m_weapon", 6}},
+                                         {dt_base, 0, 0, dt_weapon}, {0, 0x30, 0x400, 0x500}, &props_player);
+        mem.w<int32_t>(props_base + 0x40, 0x2B0);              // m_vecOrigin offset
+        mem.w<int32_t>(props_base + 0x58 + 0x40, 0x44);        // m_iTeamNum offset
+        mem.w<int32_t>(props_player + 2 * 0x58 + 0x48, 64);    // m_hWeapons elements
+        mem.w<int32_t>(props_weapon + 0x40, 0x10);             // m_clip offset
+        const uint64_t dt_world = table("DT_World", {{"m_bActive", 0}});
+
+        world_cc = klass("CWorld", dt_world, 0, 0);
+        base_cc = klass("CBaseEntity", dt_base, world_cc, 1);
+        player_cc = klass("CPlayer", dt_player, base_cc, 2);
+        mem.w<uint64_t>(head_slot, player_cc);   // the g_pClientClassHead-style root in .data
+    }
+
+    source::dump_options_t opts() const {
+        source::dump_options_t o;
+        o.scan.push_back({kSrcData, 0x10000});
+        return o;
+    }
+};
+
+TEST_CASE(source_auto_locate_and_netvar_offsets) {
+    source_fixture_t fx;
+    const auto r = source::dump(fx.mem, fx.opts());
+    if (!r.ok) std::printf("  source error: %s\n", r.error.c_str());
+    REQUIRE(r.ok);
+    for (const auto& w : r.warnings) std::printf("  warning: %s\n", w.c_str());
+    REQUIRE_EQ(r.head, fx.player_cc);
+    REQUIRE_EQ(r.classes, 3u);
+    REQUIRE_EQ(r.tables, 3u);
+    REQUIRE_EQ(r.netvars, 6u);
+
+    const std::string* nv = file_of(r, "netvars.json");
+    const std::string* rt = file_of(r, "recvtables.json");
+    REQUIRE(nv && rt);
+    const auto nj = nlohmann::json::parse(*nv);
+    const auto& n = nj["netvars"];
+    CHECK(n["DT_World->m_bActive"] == 0);
+    CHECK(n["DT_BaseEntity->m_vecOrigin"] == 0x2B0);   // baseclass adds no offset
+    CHECK(n["DT_BaseEntity->m_iTeamNum"] == 0x44);
+    CHECK(n["DT_Player->m_iHealth"] == 0x30);
+    CHECK(n["DT_Player->m_hWeapons"] == 0x400);
+    CHECK(n["DT_Weapon->m_clip"] == 0x510);            // nested table offset accumulates
+    CHECK(nj["head"].get<std::string>().rfind("0x", 0) == 0);
+
+    const auto rj = nlohmann::json::parse(*rt);
+    REQUIRE_EQ(rj["data"].size(), 3u);
+    const nlohmann::json* player_row = nullptr;
+    for (const auto& e : rj["data"])
+        if (e["class"] == "CPlayer") player_row = &e;
+    REQUIRE(player_row != nullptr);
+    CHECK((*player_row)["class_id"] == 2);
+    CHECK((*player_row)["props"].size() > 0);
+
+    // explicit head mid-list walks only what remains
+    auto o = fx.opts();
+    o.scan.clear();
+    o.head = fx.base_cc;
+    const auto r2 = source::dump(fx.mem, o);
+    REQUIRE(r2.ok);
+    CHECK(r2.classes == 2u);
+    CHECK(r2.head == fx.base_cc);
+}
+
+TEST_CASE(source_malformed_memory_fails_cleanly) {
+    {
+        fake_mem_t empty;
+        source::dump_options_t o;
+        CHECK(!source::dump(empty, o).ok);
+        o.scan.push_back({0x1000, 0x10000});   // unreadable
+        CHECK(!source::dump(empty, o).ok);
+    }
+    {
+        // garbage range: no ClientClass-shaped nodes
+        fake_mem_t g;
+        g.region(0x10000, 0x10000);
+        for (auto& b : g.regions) std::fill(b.second.begin(), b.second.end(), 0xAA);
+        source::dump_options_t o;
+        o.scan.push_back({0x10000, 0x10000});
+        const auto r = source::dump(g, o);
+        CHECK(!r.ok);
+        CHECK(has(r.error, "no ClientClass"));
+    }
+    {
+        // explicit head pointing at nothing
+        fake_mem_t empty;
+        source::dump_options_t o;
+        o.head = 0xDEADBEEF;
+        CHECK(!source::dump(empty, o).ok);
     }
 }

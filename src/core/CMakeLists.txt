@@ -23,6 +23,7 @@ set(SLOP_CORE_SOURCES
     infra/lifecycle.hpp
     infra/lifecycle.cpp
     memory/reader.hpp
+    memory/read_ahead.hpp
     memory/read_util.hpp
     memory/read_util.cpp
     memory/memscan.hpp
@@ -84,6 +85,8 @@ set(SLOP_CORE_SOURCES
     re/il2cpp_dump.cpp
     re/ue_dump.hpp
     re/ue_dump.cpp
+    re/source_dump.hpp
+    re/source_dump.cpp
     process/heap_list.hpp
     process/heap_list.cpp
     infra/deferred.hpp

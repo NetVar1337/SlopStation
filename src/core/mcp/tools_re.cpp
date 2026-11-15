@@ -8,6 +8,7 @@
 #include "core/memory/session_reader.hpp"
 #include "core/re/il2cpp_dump.hpp"
 #include "core/re/ue_dump.hpp"
+#include "core/re/source_dump.hpp"
 
 #include <cstring>
 
@@ -18,6 +19,7 @@ namespace {
 
 namespace il2cpp = slop::core::re::il2cpp;
 namespace ue = slop::core::re::ue;
+namespace source = slop::core::re::source;
 
 std::vector<uint8_t> read_host_file(const std::string& path, uint64_t cap, const char* what) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -115,7 +117,10 @@ live_module_t find_live_module(runtime::session_t& s, const std::string& want) {
 
 std::vector<uint8_t> read_live_span(runtime::session_t& s, const live_module_t& m, std::vector<std::string>& warnings) {
     process::module_dump_options_t o;
-    o.chunk_size = 256u * 1024u;
+    // console reads are socket round trips: one 8 MiB read instead of 32x
+    // 256 KiB; failed chunks are salvaged page by page inside read_segment
+    o.chunk_size = s.backend()->kind() == runtime::backend_kind_t::user_mode
+                       ? (64u << 20) : memory::kRemoteChunkBytes;
     o.strict_reads = false;
     auto read = [&s](uintptr_t a, void* dst, size_t n) { return s.read(a, dst, n); };
     std::vector<uint8_t> span;
@@ -249,6 +254,39 @@ json ue_dump_action(const json& args) {
             {"functions", r.functions}, {"scanned", scanned}, {"out_files", files}, {"warnings", r.warnings}};
 }
 
+json source_dump_action(const json& args) {
+    const std::string out_dir = require_out_dir(args, "source_dump");
+    const auto formats = parse_formats(args, {"json"}, "source_dump");
+    source::dump_options_t o;
+    if (args.contains("head")) o.head = parse_addr(args, "head");
+    if (args.contains("max_classes")) {
+        const uint64_t mc = parse_addr(args, "max_classes");
+        if (mc == 0 || mc > 100'000) fail("source_dump: max_classes must be 1..100000");
+        o.max_classes = static_cast<size_t>(mc);
+    }
+    o.json = formats.count("json") != 0;
+
+    const auto s_hold = need_session();
+    auto& s = *s_hold;
+    json scanned = json::array();
+    if (!o.head) {
+        const live_module_t m = find_live_module(s, args.value("module", std::string{}));
+        for (const auto& r : ue_scan_ranges(s, m)) {
+            o.scan.push_back({r.base, r.size});
+            scanned.push_back({{"base", r.base}, {"size", r.size}});
+        }
+        if (o.scan.empty())
+            fail("source_dump: module " + m.name + " has no writable sections to search; pass head");
+    }
+    memory::session_reader_t reader(s);
+    auto r = source::dump(reader, o);
+    if (!r.ok) fail("source_dump: " + r.error);
+    json files = json::array();
+    for (const auto& [name, body] : r.files) files.push_back(write_out(out_dir, name, body));
+    return {{"head", r.head}, {"classes", r.classes}, {"tables", r.tables}, {"props", r.props},
+            {"netvars", r.netvars}, {"scanned", scanned}, {"out_files", files}, {"warnings", r.warnings}};
+}
+
 } // namespace
 
 // tool: re
@@ -258,6 +296,7 @@ json tool_re(const json& args) {
     // engine-metadata dumpers work on host files / the live target, not the shared image
     if (action == "il2cpp_dump") return il2cpp_dump_action(args);
     if (action == "ue_dump") return ue_dump_action(args);
+    if (action == "source_dump") return source_dump_action(args);
 
     // app loaded binary unless a path is given
     std::optional<ds::binary_lock_t> shared_lock;
@@ -512,7 +551,7 @@ json tool_re(const json& args) {
         return out;
     }
 
-    fail("re: unknown action (rtti_scan|vftable|danger|libsig|il2cpp_dump|ue_dump)");
+    fail("re: unknown action (rtti_scan|vftable|danger|libsig|il2cpp_dump|ue_dump|source_dump)");
 }
 
 } // namespace slop::core::mcp::detail
