@@ -161,3 +161,24 @@ fallback is visible rather than silent.
 Expressions are evaluated against `rip`, `rsp` and `rbp` only. An expression
 that needs any other register, reads unmapped memory, or uses an opcode outside
 the supported subset ends the walk instead of inventing a frame address.
+
+## Harvesting decrypted strings
+
+Games decrypt strings in place on demand, so a static dump of the same bytes
+shows only ciphertext. `debugger.harvest_strings` polls a buffer and reports
+the printable strings that appear, deduplicated across passes and addresses:
+
+```json
+{ "tool": "debugger", "action": "harvest_strings",
+  "params": { "addr": "0x2A000000", "len": 65536,
+              "duration_ms": 10000, "interval_ms": 50, "min_len": 4 } }
+```
+
+Each hit carries `addr`, `text`, `len` and `at_ms` (when it first appeared).
+`passes` and `readable_passes` show whether the window was actually sampled.
+Trigger the code path that decrypts (open a menu, spawn, load a map) while it
+runs. To find the decrypt routine itself, pair it with `memory.watch_add` and
+`debugger.ps4_find_write` on the destination buffer.
+
+It works on any backend and needs no debug session, so it is safe to run on a
+live console while the game is playing.

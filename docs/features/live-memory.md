@@ -133,3 +133,43 @@ call returns no addresses instead of silently wrong ones.
 
 [Find and freeze a value](../tutorials/local-process.md) — the scanner and watchlist on a
 local process, and [Live debugging](live-debugging.md) for the "who writes this" flow.
+
+## Retrying the holes in a dump
+
+A dump of a live process is rarely complete: guard pages, regions the payload
+cannot read, and pages that are not mapped yet all become zero-filled holes.
+`memory.dump` reports them as spans instead of only a byte count:
+
+```json
+{ "tool": "memory", "action": "dump",
+  "params": { "addr": "0x400000", "len": "0x10000000", "path": "C:/dumps/eboot.bin" } }
+```
+
+The reply carries `holes: [{addr, size, offset}]`. Once the game maps those
+pages (or you change their protection), `memory.dump_holes` re-reads just those
+spans and patches them into the existing file in place:
+
+```json
+{ "tool": "memory", "action": "dump_holes",
+  "params": { "addr": "0x400000", "len": "0x10000000", "path": "C:/dumps/eboot.bin",
+              "holes": [ { "addr": "0x41234000", "size": 4096 } ] } }
+```
+
+`bytes_filled` is what could now be read, `remaining` lists the spans that are
+still unreadable, and `complete` is true when nothing is left. `addr`/`len` must
+match the original dump so the offsets line up. `dump_regions` records the same
+`holes` array per region in its `index.json`.
+
+## Code that belongs to no module
+
+JIT output, runtime-unpacked stubs and generated thunks live in executable pages
+outside every loaded module, so a module dump structurally cannot see them.
+`memory.dynamic_code` lists those regions and optionally dumps them:
+
+```json
+{ "tool": "memory", "action": "dynamic_code", "params": { "dir": "C:/dumps/dyn" } }
+```
+
+Each entry carries `base`, `size`, `protect` and `type`; with `dir` set, each
+region is also written as `dyn-<base>-<size>.bin`. An empty result means nothing
+is JIT'd at that moment, not that the target has no dynamic code.

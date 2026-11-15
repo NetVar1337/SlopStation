@@ -9,6 +9,24 @@ section matching the pushed tag as the GitHub release notes.
 
 ### Added
 
+- `memory.dump` reports the unreadable spans it zero-filled as `holes:
+  [{addr, size, offset}]`, and `memory.dump_holes` re-reads just those spans and
+  patches them into the existing file once the game maps them. `dump_regions`
+  records the same per region in `index.json`. Turns an incomplete dump into a
+  retry list instead of a whole second pass.
+- `memory.dynamic_code`: executable regions that belong to no module (JIT output,
+  runtime-unpacked stubs, generated thunks), which a module dump structurally
+  cannot see. `dir` also writes each region to a file.
+- `debugger.harvest_strings`: poll a buffer and capture printable strings as the
+  game decrypts them, deduplicated across passes and addresses with the time
+  each first appeared. Works on any backend with no debug session.
+- `xray.cff_sweep`: apply the flattening detector across the whole function index
+  and report the candidates, instead of scoring one function at a time.
+- Rebuilt ELF dumps now carry synthesized section headers: one named section per
+  segment (`.text` / `.rodata` / `.data` from the protections) plus `.shstrtab`,
+  so Ghidra and IDA see a real layout instead of one anonymous blob per
+  `PT_LOAD`.
+
 - `memory.offsets_build`: generate an `offsets_verify` manifest from named
   addresses. Each offset gets an anchor pattern decoded in place and grown until
   it is unique inside the module's executable segment, plus that segment's

@@ -95,3 +95,22 @@ indexes rebuild lazily so `functions`/`xrefs`/`strings` stay correct after an ed
 ## Walkthrough
 
 [Dump, rename, decompile](../tutorials/dump-rename-decompile.md).
+
+## Sweeping for flattened functions
+
+`xray.cff` scores one function. `xray.cff_sweep` applies the same detector
+across the whole function index and reports the ones that look flattened, so a
+protected binary does not have to be clicked through one function at a time:
+
+```json
+{ "tool": "xray", "action": "cff_sweep",
+  "params": { "limit": 20000, "min_blocks": 8, "max_report": 500 } }
+```
+
+Each hit carries `va`, `block_count`, `dispatcher`, `dispatcher_backedges`,
+`state_variable` and `state_block_count`. `functions_scanned` versus
+`total_functions` says how much of the index the sweep covered; raise `limit`
+to go wider. Feed a hit into `devirt.recover_cfg` to rebuild its CFG.
+
+This is a heuristic ranking, not a proof: a large switch statement can look
+like a dispatcher. Confirm with `xray.cfg` on the candidate before trusting it.
