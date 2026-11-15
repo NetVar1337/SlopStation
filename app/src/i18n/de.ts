@@ -134,6 +134,7 @@ export const de = {
   "workspace.structs": "Structs",
   "workspace.unpacker": "Unpacker",
   "workspace.xray": "X-ray",
+  "workspace.dumpers": "Dumper",
   "workspace.patches": "Patches",
   "workspace.network": "Netzwerk",
   "workspace.emulate": "Emulator",

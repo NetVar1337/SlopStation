@@ -6,6 +6,7 @@ import { ChevronLeft, ChevronRight, FolderOpen, ScanSearch, X } from "lucide-rea
 import IconButton from "@/components/IconButton";
 import Tabs, { panelId, tabId } from "@/components/Tabs";
 import DisassemblyView from "@/components/panels/DisassemblyView";
+import DumpersPanel from "@/components/panels/DumpersPanel";
 import DecompView from "@/components/panels/DecompView";
 import DebuggerView from "@/components/panels/DebuggerView";
 import EmulatorPanel from "@/components/panels/EmulatorPanel";
@@ -43,6 +44,7 @@ const kTabs: readonly {
   { id: "structs", labelKey: "workspace.structs", needs: "image" },
   { id: "unpacker", labelKey: "workspace.unpacker", needs: "image" },
   { id: "xray", labelKey: "workspace.xray", needs: "image" },
+  { id: "dumpers", labelKey: "workspace.dumpers", needs: "none" },
   { id: "patch", labelKey: "workspace.patches", needs: "image" },
   { id: "network", labelKey: "workspace.network", needs: "none" },
   { id: "emulate", labelKey: "workspace.emulate", needs: "none" },
@@ -174,6 +176,8 @@ export default function WorkspacePanel() {
         return <UnpackerView />;
       case "xray":
         return <XrayPanel />;
+      case "dumpers":
+        return <DumpersPanel />;
       case "patch":
         return <PatchPanel />;
       case "network":

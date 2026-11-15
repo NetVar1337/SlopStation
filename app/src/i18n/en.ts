@@ -141,6 +141,7 @@ export const en = {
   "workspace.structs": "Structs",
   "workspace.unpacker": "Unpacker",
   "workspace.xray": "X-ray",
+  "workspace.dumpers": "Dumpers",
   "workspace.patches": "Patches",
   "workspace.network": "Network",
   "workspace.emulate": "Emulator",

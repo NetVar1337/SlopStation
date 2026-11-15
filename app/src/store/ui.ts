@@ -18,6 +18,7 @@ export type WorkspaceTab =
   | "structs"
   | "unpacker"
   | "xray"
+  | "dumpers"
   | "patch"
   | "network"
   | "emulate";
