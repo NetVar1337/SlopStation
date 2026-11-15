@@ -7,6 +7,8 @@ section matching the pushed tag as the GitHub release notes.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-15
+
 ### Added
 
 - `memory.dump` reports the unreadable spans it zero-filled as `holes:
