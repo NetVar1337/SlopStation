@@ -83,6 +83,8 @@ inline constexpr uint16_t IMAGE_NT_OPTIONAL_HDR64_MAGIC = 0x20B;
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <map>
+#include <string>
 #include <system_error>
 #include <unordered_map>
 
@@ -950,9 +952,31 @@ struct elf64_phdr_t {
     uint64_t p_memsz;
     uint64_t p_align;
 };
+struct elf64_shdr_t {
+    uint32_t sh_name;
+    uint32_t sh_type;
+    uint64_t sh_flags;
+    uint64_t sh_addr;
+    uint64_t sh_offset;
+    uint64_t sh_size;
+    uint32_t sh_link;
+    uint32_t sh_info;
+    uint64_t sh_addralign;
+    uint64_t sh_entsize;
+};
 #pragma pack(pop)
 static_assert(sizeof(elf64_ehdr_t) == 64);
 static_assert(sizeof(elf64_phdr_t) == 56);
+static_assert(sizeof(elf64_shdr_t) == 64);
+
+// a section name for one segment, by its protection: a dumped eboot has no
+// section headers at all, so synthesizing them gives the analyzer .text /
+// .rodata / .data instead of one anonymous blob per PT_LOAD
+std::string section_name_for(const mapped_segment_t& s, int ordinal) {
+    const char* base = (s.prot & 4) ? ".text" : ((s.prot & 2) ? ".data" : ".rodata");
+    if (ordinal == 0) return base;
+    return std::string(base) + "." + std::to_string(ordinal);
+}
 
 // copy [start, end) through read into dst; unreadable parts zero-fill (non
 // strict) or fail. Returns false only on a strict failure. Chunk reads are
@@ -1128,9 +1152,67 @@ module_dump_result_t reconstruct_elf_from_segments(
     eh.e_ehsize    = sizeof(elf64_ehdr_t);
     eh.e_phentsize = sizeof(elf64_phdr_t);
     eh.e_phnum     = static_cast<uint16_t>(n);
-    eh.e_shentsize = 64;
-    eh.e_shnum     = 0;
-    eh.e_shstrndx  = 0;
+    // section headers: one per segment (named by protection) plus .shstrtab.
+    // Appended after the segment data, so p_offset values stay untouched
+    std::vector<std::string> sec_names;
+    {
+        std::map<std::string, int> seen;
+        for (size_t i = 0; i < n; ++i) {
+            const std::string sec_base =
+                (segments[i].prot & 4) ? ".text" : ((segments[i].prot & 2) ? ".data" : ".rodata");
+            const int ordinal = seen[sec_base]++;
+            sec_names.push_back(section_name_for(segments[i], ordinal));
+        }
+    }
+    std::string shstr;
+    shstr.push_back('\0');
+    std::vector<uint32_t> name_off;
+    for (const auto& nm : sec_names) {
+        name_off.push_back(static_cast<uint32_t>(shstr.size()));
+        shstr += nm;
+        shstr.push_back('\0');
+    }
+    const uint32_t shstr_name = static_cast<uint32_t>(shstr.size());
+    shstr += ".shstrtab";
+    shstr.push_back('\0');
+
+    const uint64_t shstr_off = align_up(output.size(), 8);
+    const uint64_t sht_off = align_up(shstr_off + shstr.size(), 8);
+    const uint64_t total = sht_off + (n + 2) * sizeof(elf64_shdr_t);
+    if (total > kMaxOutputBytes) {
+        result.error = "reconstructed ELF with sections larger than the dump cap (512 MiB)";
+        return result;
+    }
+    output.resize(static_cast<size_t>(total), 0);
+    std::memcpy(output.data() + shstr_off, shstr.data(), shstr.size());
+
+    std::vector<elf64_shdr_t> shdrs(n + 2, elf64_shdr_t{});
+    for (size_t i = 0; i < n; ++i) {
+        auto& sh = shdrs[i + 1];
+        sh.sh_name = name_off[i];
+        sh.sh_type = 1;   // SHT_PROGBITS
+        sh.sh_flags = 2;  // SHF_ALLOC
+        if (segments[i].prot & 1) sh.sh_flags |= 1;   // SHF_WRITE
+        if (segments[i].prot & 4) sh.sh_flags |= 4;   // SHF_EXECINSTR
+        sh.sh_addr = segments[i].start;
+        sh.sh_offset = offsets[i];
+        sh.sh_size = segments[i].end - segments[i].start;
+        sh.sh_addralign = 16;
+    }
+    {
+        auto& sh = shdrs[n + 1];
+        sh.sh_name = shstr_name;
+        sh.sh_type = 3;   // SHT_STRTAB
+        sh.sh_offset = shstr_off;
+        sh.sh_size = shstr.size();
+        sh.sh_addralign = 1;
+    }
+    std::memcpy(output.data() + sht_off, shdrs.data(), shdrs.size() * sizeof(elf64_shdr_t));
+
+    eh.e_shentsize = sizeof(elf64_shdr_t);
+    eh.e_shnum     = static_cast<uint16_t>(n + 2);
+    eh.e_shstrndx  = static_cast<uint16_t>(n + 1);
+    eh.e_shoff     = sht_off;
     std::memcpy(output.data(), &eh, sizeof(eh));
     for (size_t i = 0; i < n; ++i) {
         const auto& s = segments[i];
@@ -1151,7 +1233,8 @@ module_dump_result_t reconstruct_elf_from_segments(
     result.section_count = n;
     if (!meta.had_header)
         result.warnings.emplace_back("no ELF header in memory: rebuilt one from the console maps "
-                                     "(entry unknown, no section headers/symbols)");
+                                     "(entry from the first executable segment; sections named "
+                                     "from the segment protections; no symbols)");
     if (info) *info = meta;
     return result;
 }

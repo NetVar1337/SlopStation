@@ -248,7 +248,8 @@ TEST_CASE(module_dump_rebuilds_elf_from_segments) {
     CHECK(rd<uint64_t>(out, 32) == 64u);  // phoff
     CHECK(rd<uint16_t>(out, 54) == 56);   // phentsize
     REQUIRE(rd<uint16_t>(out, 56) == 3);  // phnum
-    CHECK(rd<uint16_t>(out, 60) == 0);    // no section headers
+    CHECK(rd<uint16_t>(out, 60) == 5);    // synthesized sections: null + 3 + shstrtab
+    CHECK(rd<uint16_t>(out, 58) == 64);   // shentsize
     const uint32_t want_flags[3] = {5, 4, 6};
     uint64_t prev_end = 0;
     for (size_t i = 0; i < 3; ++i) {
@@ -327,6 +328,59 @@ TEST_CASE(module_dump_elf_unreadable_pages_strict_and_lenient) {
     CHECK(!process::reconstruct_elf_from_segments({}, rf, out).ok);
 }
 
+TEST_CASE(module_dump_elf_synthesizes_named_sections) {
+    using namespace slop::core;
+    fake_space_t mem;
+    mem.bytes[0x400000] = 0xC3;
+    const std::vector<process::mapped_segment_t> segs = {
+        {0x400000, 0x480000, 5},    // r-x -> .text
+        {0x480000, 0x4C0000, 1},    // r-- -> .rodata
+        {0x4C8000, 0x500000, 3},    // rw- -> .data
+    };
+    std::vector<uint8_t> out;
+    auto res = process::reconstruct_elf_from_segments(
+        segs, [&](uintptr_t a, void* d, size_t n) { return mem.read(a, d, n); }, out);
+    REQUIRE(res.ok);
+
+    // e_shoff/e_shnum/e_shstrndx point at a real table
+    REQUIRE(out.size() > 64);
+    auto rd16 = [&](size_t o) { return static_cast<uint16_t>(out[o] | (out[o + 1] << 8)); };
+    auto rd64 = [&](size_t o) {
+        uint64_t v = 0;
+        for (int i = 0; i < 8; ++i) v |= static_cast<uint64_t>(out[o + i]) << (8 * i);
+        return v;
+    };
+    const uint64_t shoff = rd64(0x28);
+    const uint16_t shnum = rd16(0x3C);
+    const uint16_t shstrndx = rd16(0x3E);
+    CHECK(shoff > 0);
+    CHECK(shnum == 5);            // null + 3 segments + shstrtab
+    CHECK(shstrndx == 4);
+    REQUIRE(shoff + static_cast<uint64_t>(shnum) * 64 <= out.size());
+
+    // the shstrtab holds the synthesized names
+    const size_t strtab = static_cast<size_t>(shoff) + static_cast<size_t>(shstrndx) * 64;
+    const uint64_t str_off = rd64(strtab + 0x18);
+    const uint64_t str_size = rd64(strtab + 0x20);
+    REQUIRE(str_off + str_size <= out.size());
+    const std::string names(reinterpret_cast<const char*>(out.data() + str_off),
+                            static_cast<size_t>(str_size));
+    CHECK(names.find(".text") != std::string::npos);
+    CHECK(names.find(".rodata") != std::string::npos);
+    CHECK(names.find(".data") != std::string::npos);
+    CHECK(names.find(".shstrtab") != std::string::npos);
+
+    // section 1 is the executable segment and carries SHF_EXECINSTR
+    const size_t sec1 = static_cast<size_t>(shoff) + 64;
+    const uint64_t flags = rd64(sec1 + 0x08);
+    CHECK((flags & 4) != 0);      // SHF_EXECINSTR
+    CHECK((flags & 2) != 0);      // SHF_ALLOC
+    CHECK(rd64(sec1 + 0x10) == 0x400000u);   // sh_addr
+
+    // the last section is writable data
+    const size_t sec3 = static_cast<size_t>(shoff) + 3 * 64;
+    CHECK((rd64(sec3 + 0x08) & 1) != 0);     // SHF_WRITE
+}
 TEST_CASE(module_dump_raw_span_zero_fills_gaps) {
     using namespace slop::core;
     fake_space_t mem;
