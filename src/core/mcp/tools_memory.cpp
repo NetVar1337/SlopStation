@@ -10,6 +10,7 @@
 #include "core/memory/console_scan.hpp"
 #include "core/memory/dissect.hpp"
 #include "core/memory/offsets.hpp"
+#include "core/memory/read_ahead.hpp"
 #include "core/memory/session_reader.hpp"
 
 namespace slop::core::mcp::detail {
@@ -246,30 +247,41 @@ span_dump_t stream_span(runtime::session_t& s, uint64_t addr, uint64_t len, std:
                         bool strict, size_t chunk) {
     constexpr size_t kPage = 0x1000;
     span_dump_t r;
-    std::vector<uint8_t> buf(chunk);
-    for (uint64_t off = 0; off < len;) {
+    // double-buffered: chunk k+1 streams in while chunk k is retried/written
+    std::vector<uint8_t> buf[2];
+    buf[0].assign(chunk, 0);
+    buf[1].assign(chunk, 0);
+    memory::read_ahead_t ra([&s](uintptr_t a, void* d, size_t n) { return s.read(a, d, n); });
+    size_t slot = 0;
+    for (uint64_t off = 0; off < len; slot = 1 - slot) {
         const size_t n = static_cast<size_t>(std::min<uint64_t>(chunk, len - off));
         const uint64_t at = addr + off;
-        auto io = s.read(static_cast<uintptr_t>(at), buf.data(), n);
+        uint8_t* cur = buf[slot].data();
+        if (off + n < len) {
+            const size_t nn =
+                static_cast<size_t>(std::min<uint64_t>(chunk, len - (off + n)));
+            ra.prefetch(static_cast<uintptr_t>(at + n), buf[1 - slot].data(), nn);
+        }
+        auto io = ra.reap();
         if (!io.ok || io.bytes != n) {
             // page granular retry, page boundaries follow the target address
             size_t p = 0;
             while (p < n) {
                 const size_t step = std::min<size_t>(n - p, kPage - ((at + p) & (kPage - 1)));
-                auto pio = s.read(static_cast<uintptr_t>(at + p), buf.data() + p, step);
+                auto pio = s.read(static_cast<uintptr_t>(at + p), cur + p, step);
                 if (!pio.ok || pio.bytes != step) {
                     if (strict) {
                         r.error = "unreadable memory at " + addr_hex_str(at + p) + ": " +
                                   runtime::ps4::io_error_str(pio.error);
                         return r;
                     }
-                    std::memset(buf.data() + p, 0, step);
+                    std::memset(cur + p, 0, step);
                     r.unreadable += step;
                 }
                 p += step;
             }
         }
-        out.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(n));
+        out.write(reinterpret_cast<const char*>(cur), static_cast<std::streamsize>(n));
         if (!out) {
             r.error = "file write failed";
             return r;

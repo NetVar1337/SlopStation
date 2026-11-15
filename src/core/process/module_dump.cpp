@@ -1,6 +1,7 @@
 #include "core/process/module_dump.hpp"
 
 #include "core/disasm/pe_parser.hpp"
+#include "core/memory/read_ahead.hpp"
 #include "core/runtime/session.hpp"
 
 #include "core/infra/paths.hpp"
@@ -953,12 +954,21 @@ struct elf64_phdr_t {
 static_assert(sizeof(elf64_ehdr_t) == 64);
 static_assert(sizeof(elf64_phdr_t) == 56);
 
-// copy [start, end) through read into dst; unreadable chunks zero-fill (non
-// strict) or fail. Returns false only on a strict failure
+// copy [start, end) through read into dst; unreadable parts zero-fill (non
+// strict) or fail. Returns false only on a strict failure. Chunk reads are
+// double-buffered (chunk k+1 streams in while chunk k is validated) and a
+// failed chunk is salvaged page by page, so one protected page costs 4 KiB
+// of zero-fill, not the whole chunk
 bool read_segment(const module_read_fn_t& read, uint64_t start, uint64_t end, uint8_t* dst,
                   const module_dump_options_t& options, module_dump_result_t& result) {
     const size_t chunk = std::max<size_t>(options.chunk_size, 4096);
     uint64_t failed_from = 0, failed_bytes = 0;
+    auto note_fail = [&](uint64_t a, size_t n) {
+        std::memset(dst + (a - start), 0, n);
+        result.complete = false;
+        if (!failed_bytes) failed_from = a;
+        failed_bytes += n;
+    };
     auto flush_warning = [&] {
         if (!failed_bytes) return;
         char b[96];
@@ -968,26 +978,42 @@ bool read_segment(const module_read_fn_t& read, uint64_t start, uint64_t end, ui
         result.warnings.emplace_back(b);
         failed_bytes = 0;
     };
-    for (uint64_t a = start; a < end;) {
+
+    const uint64_t total = end - start;
+    const size_t nchunks = static_cast<size_t>((total + chunk - 1) / chunk);
+    memory::read_ahead_t ra(read);
+    auto issue = [&](size_t k) {
+        const uint64_t a = start + k * chunk;
+        ra.prefetch(static_cast<uintptr_t>(a), dst + (a - start),
+                    static_cast<size_t>(std::min<uint64_t>(chunk, end - a)));
+    };
+    issue(0);
+    for (size_t k = 0; k < nchunks; ++k) {
+        if (k + 1 < nchunks) issue(k + 1);
+        const uint64_t a = start + k * chunk;
         const size_t take = static_cast<size_t>(std::min<uint64_t>(chunk, end - a));
-        uint8_t* out = dst + (a - start);
-        const auto io = read(static_cast<uintptr_t>(a), out, take);
-        if (!io.ok || io.bytes != take) {
-            if (options.strict_reads) {
-                char b[96];
-                std::snprintf(b, sizeof(b), "read failed at 0x%llX (%zu bytes)",
-                              static_cast<unsigned long long>(a), take);
-                result.error = b;
-                return false;
-            }
-            std::memset(out, 0, take);
-            result.complete = false;
-            if (!failed_bytes) failed_from = a;
-            failed_bytes += take;
-        } else {
+        const auto io = ra.reap();
+        if (io.ok && io.bytes == take) {
             flush_warning();
+            continue;
         }
-        a += take;
+        if (options.strict_reads) {
+            char b[96];
+            std::snprintf(b, sizeof(b), "read failed at 0x%llX (%zu bytes)",
+                          static_cast<unsigned long long>(a), take);
+            result.error = b;
+            return false;
+        }
+        // salvage readable pages inside the failed chunk
+        constexpr size_t kPage = 0x1000;
+        for (size_t p = 0; p < take;) {
+            const size_t step =
+                std::min<size_t>(take - p, kPage - ((a + p) & (kPage - 1)));
+            const auto pio = read(static_cast<uintptr_t>(a + p), dst + (a - start) + p, step);
+            if (pio.ok && pio.bytes == step) flush_warning();
+            else note_fail(a + p, step);
+            p += step;
+        }
     }
     flush_warning();
     return true;

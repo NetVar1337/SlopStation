@@ -4,6 +4,7 @@
 #include "core/infra/paths.hpp"
 #include "core/mcp/tools_common.hpp"
 #include "core/compat/portable.hpp"
+#include "core/memory/reader.hpp"
 #include "core/network/net_socket.hpp"
 #include "core/runtime/console_manager.hpp"
 
@@ -1034,6 +1035,7 @@ json tool_target(const json& args) {
 
         process::module_dump_options_t options;
         options.strict_reads = args.value("strict", true);
+        options.chunk_size = 1u << 20;   // local ReadProcessMemory: fewer syscalls
         const std::string layout = args.value("layout", std::string("virtual"));
         if (layout != "virtual" && layout != "file")
             fail("dump_module: layout must be virtual or file");
@@ -1237,7 +1239,12 @@ json tool_target(const json& args) {
         }
 
         process::module_dump_options_t options;
-        options.chunk_size = 256u * 1024u;
+        // one console read is one socket round trip: use the scanner's remote
+        // chunk size (ps4debug/ps5debug stream up to 16 MiB per command);
+        // failed chunks are salvaged page by page inside read_segment
+        const bool remote =
+            session.backend()->kind() != runtime::backend_kind_t::user_mode;
+        options.chunk_size = remote ? memory::kRemoteChunkBytes : (1u << 20);
         // a console module often has pages the payload cannot read; zero-fill
         // them (complete=false) unless the caller asks for a strict dump
         options.strict_reads = args.value("strict", false);

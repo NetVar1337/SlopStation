@@ -1,6 +1,7 @@
 #include "harness.hpp"
 
 #include "core/disasm/pe_parser.hpp"
+#include "core/memory/read_ahead.hpp"
 #include "core/process/module_dump.hpp"
 #include "core/runtime/backend_registry.hpp"
 #include "core/runtime/session.hpp"
@@ -8,11 +9,14 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -616,4 +620,75 @@ TEST_CASE(module_dump_imports_from_intact_import_directory) {
     REQUIRE_EQ(pe.imports[0].functions.size(), size_t{2});
     CHECK(pe.imports[0].functions[0].name == "FuncA");
     CHECK(pe.imports[0].functions[0].iat_rva == 0x2100u);
+}
+
+TEST_CASE(read_ahead_buffers_overlap_and_stay_ordered) {
+    using namespace slop::core;
+    std::atomic<int> in_flight{0}, max_in_flight{0};
+    memory::read_ahead_t ra([&](uintptr_t a, void* d, size_t n) {
+        const int now = ++in_flight;
+        int prev = max_in_flight.load();
+        while (now > prev && !max_in_flight.compare_exchange_weak(prev, now)) {}
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        runtime::io_result_t r;
+        if (a == 0x3000) {   // one deterministic failure for the reap checks
+            --in_flight;
+            r.error = 5;
+            return r;
+        }
+        auto* out = static_cast<uint8_t*>(d);
+        for (size_t i = 0; i < n; ++i) out[i] = static_cast<uint8_t>(a + i);
+        --in_flight;
+        r.ok = true;
+        r.bytes = n;
+        return r;
+    });
+    constexpr size_t kChunk = 64;
+    std::vector<uint8_t> a(kChunk), b(kChunk);
+    ra.prefetch(0x1000, a.data(), kChunk);
+    ra.prefetch(0x2030, b.data(), kChunk);   // second slot: no wait on chunk 0
+    const auto r0 = ra.reap();
+    REQUIRE(r0.ok);
+    REQUIRE(r0.bytes == kChunk);
+    CHECK(a[0] == 0x00 && a[1] == 0x01);     // payload is the low address byte
+    const auto r1 = ra.reap();
+    REQUIRE(r1.ok);
+    CHECK(b[0] == 0x30 && b[1] == 0x31);
+    CHECK(max_in_flight.load() == 2);        // the two reads really overlapped
+
+    // a failure surfaces at its own reap and does not poison the next chunk
+    ra.prefetch(0x3000, a.data(), kChunk);   // fails by address above
+    ra.prefetch(0x4000, b.data(), kChunk);
+    const auto r2 = ra.reap();
+    CHECK(!r2.ok);
+    const auto r3 = ra.reap();
+    CHECK(r3.ok);
+    CHECK(b[0] == 0x00);
+}
+
+TEST_CASE(module_dump_failed_chunk_salvaged_page_by_page) {
+    using namespace slop::core;
+    fake_space_t mem;
+    mem.bytes[0x400000] = 0x11;   // chunk 0, good page
+    mem.bytes[0x408000] = 0x33;   // chunk 1 start
+    mem.bad_lo = 0x401000;        // one protected page inside chunk 0
+    mem.bad_hi = 0x402000;
+    const std::vector<process::mapped_segment_t> segs = {{0x400000, 0x410000, 5}};
+    std::vector<uint8_t> out;
+    process::module_dump_options_t o;
+    o.chunk_size = 0x8000;        // the bad page fails chunk 0 wholesale
+    o.strict_reads = false;
+    const auto res = process::dump_raw_span(
+        segs, [&](uintptr_t a, void* d, size_t n) { return mem.read(a, d, n); }, out, o);
+    REQUIRE(res.ok);
+    REQUIRE(out.size() == 0x10000u);
+    CHECK(!res.complete);
+    CHECK(out[0] == 0x11);              // good page of the failed chunk survives
+    CHECK(out[0x1000] == 0x00);         // the bad page itself is zero-filled
+    CHECK(out[0x1FFF] == 0x00);
+    CHECK(out[0x8000] == 0x33);         // chunk 1 (prefetched) intact
+    bool named = false;
+    for (const auto& w : res.warnings)
+        if (w.find("0x401000..0x402000") != std::string::npos) named = true;
+    CHECK(named);
 }
